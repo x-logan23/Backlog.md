@@ -21,8 +21,8 @@ describe("buildBoardEditorRows", () => {
 	});
 
 	it("ROUND-TRIPS HIDE-ALL: board.columns === [] renders every row hidden", () => {
-		// This is the regression case from review-13 finding #1. Using
-		// `configured.length > 0` would incorrectly mark every row visible,
+		// Regression case: using `configured.length > 0` (instead of
+		// `!== undefined`) would incorrectly mark every row visible,
 		// making the saved hide-all state invisible to the user.
 		expect(buildBoardEditorRows(statuses, { columns: [] })).toEqual([
 			{ status: "To Do", color: undefined, visible: false },

@@ -9,8 +9,10 @@ Drop-in templates for running a coder ↔ reviewer ↔ human-review loop on top 
 | `code.md` | Task → `In Progress` | Reads the task, implements it (initial work or reviewer rework), records notes, moves to `In Review`. Handles merge conflicts inline. |
 | `review.md` | Task → `In Review` | Audits the diff against acceptance criteria + DoD, writes structured findings into the task, moves to either `In Progress` (rework) or `Human Review` (approved). |
 | `ready.md` | Task → `Human Review` | Optional notifier. Prints a one-screen summary into the log file. Extend it if you want Slack/email notifications. |
-| `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. |
-| `dispatch.sh` | All of the above (POSIX) | Same, for `sh` / `bash`. |
+| `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. Also strips `ANTHROPIC_API_KEY` (forces subscription auth), scopes MCP servers per role, records token usage, and creates the MR on Human Review. |
+| `dispatch.sh` | All of the above (POSIX) | Same core loop, for `sh` / `bash`. |
+| `token-report.ps1` | After a coder/reviewer session ends (Windows) | Reads the finished session's token usage out-of-band from its transcript; appends to `logs/tokens.csv` and a per-task line. Zero extra agent tokens. |
+| `create-mr.ps1` | Task → `Human Review` (Windows, GitLab) | Deterministic, idempotent GitLab MR creation. Needs `GITLAB_PROJECT_ID` (skips cleanly when unset, e.g. GitHub) and a token via `GITLAB_TOKEN` / `.mcp.json` / codex config. |
 | `logs/` | (created on first run) | Per-invocation logs (`<timestamp>-<task_id>-<status>.log` plus `.err` for stderr). Inspect these when a hook misbehaves. |
 
 ## Prerequisites
@@ -48,6 +50,44 @@ onStatusChange: '"$PWD/backlog/prompts/dispatch.sh"'
 ```
 
 Then change a task's status (drag it on the kanban, edit it via CLI, or move it via MCP) and the corresponding agent fires.
+
+## Code hosting & merge/pull requests
+
+When a task reaches `Human Review`, the loop opens a merge request for the task's
+implementation branch. This happens two ways, and both are optional:
+
+1. **The reviewer agent** (`review.md`, Step 6) opens it through whatever code-host
+   MCP server is wired into `.claude/mcp-reviewer.json`.
+2. **`create-mr.ps1`** opens it deterministically from the dispatcher as a backstop,
+   so an approved task still gets its MR even if the agent forgets.
+
+### Environment variables
+
+| Variable | Used by | Purpose |
+|----------|---------|---------|
+| `GITLAB_PROJECT_ID` | `create-mr.ps1` | Numeric project id. **If unset, MR creation is skipped entirely** (the reviewer agent's own step still runs). |
+| `GITLAB_TOKEN` | `create-mr.ps1`, `mcp-reviewer.json` | API token. Falls back to `.mcp.json` → `~/.codex/config.toml` if the env var is absent. |
+| `GITLAB_TARGET_BRANCH` | `create-mr.ps1` | Target branch for the MR. Defaults to `main`. |
+
+The `.claude/mcp-reviewer.json` scaffolded by `backlog init` references the token as
+`${GITLAB_TOKEN}` — set the env var, don't hardcode the secret into the committed file.
+
+### Using GitHub, Bitbucket, or another host
+
+The naming above is GitLab-flavored because `create-mr.ps1` talks to the GitLab REST
+API directly, but nothing about the loop is GitLab-specific. To target a different host,
+pick whichever fits:
+
+- **Let the agent do it (host-agnostic, no script changes).** Swap the `gitlab` entry in
+  `.claude/mcp-reviewer.json` for your host's MCP server (e.g. a GitHub MCP server), update
+  `review.md` Step 6 to say "open a pull request" instead of "merge request", and leave
+  `GITLAB_PROJECT_ID` unset so `create-mr.ps1` no-ops. This is the simplest path.
+- **Keep the deterministic backstop.** Copy `create-mr.ps1` to e.g. `create-pr.ps1`, point
+  `Invoke-RestMethod` at your host's API (GitHub: `POST /repos/{owner}/{repo}/pulls` with an
+  `Authorization: Bearer` header; Bitbucket: `POST .../pullrequests`), and swap the call in
+  `dispatch.ps1`'s Human Review block. The branch-resolution and idempotency logic ports as-is.
+
+Either way the rest of the loop — coder, reviewer, statuses, token accounting — is unchanged.
 
 ## Trying it out
 
