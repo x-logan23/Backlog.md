@@ -199,23 +199,14 @@ bunx tsc --noEmit
 
 ## Configuración del proyecto real (para usar el loop)
 
-En `backlog/config.yml` del proyecto donde corres los agentes:
+`backlog init` en este fork ya provisiona todo el loop automáticamente: las 5 columnas (`To Do → In Progress → In Review → Human Review → Done`), el hook `onStatusChange` + `shell` en `config.yml`, y hace scaffold de `backlog/prompts/*` (dispatch, prompts, token-report, create-mr) y de `.claude/mcp-{coder,reviewer}.json`. No hace falta copiar nada a mano. Ver `src/core/init.ts` (`applyAgentLoopConfigDefaults` + `scaffoldAgentLoopFiles`).
+
+El `config.yml` resultante contiene:
 
 ```yaml
 statuses: ["To Do", "In Progress", "In Review", "Human Review", "Done"]
-shell: "powershell"
+shell: "powershell"   # "auto" (sh) en POSIX
 onStatusChange: 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PWD\backlog\prompts\dispatch.ps1"'
-```
-
-Para POSIX:
-```yaml
-shell: "sh"
-onStatusChange: '"$PWD/backlog/prompts/dispatch.sh"'
-```
-
-Copia los prompts desde el fork:
-```bash
-xcopy /E /I "D:\1064n\Programacion\claude\Backlog.md\backlog\prompts" ".\backlog\prompts"
 ```
 
 El agente coder leerá la tarea por MCP, implementará, moverá a "In Review". El reviewer auditará el diff y moverá a "Human Review" (ok) o "In Progress" (rework). Edita `code.md`, `review.md`, `ready.md` con las convenciones de tu proyecto.
@@ -243,29 +234,13 @@ claude mcp add backlog --scope user -- backlog mcp start
 
 ## Deuda técnica conocida
 
-1. **`BACK-466` (borrado del backlog upstream):** Tests de regresión para la race condition de `loadAllData`, WS reconnect, y el dispatcher PowerShell. Los tests del dispatcher (`dispatch-ps1.test.ts`) ejercitan el path real de stdin. Los de race condition están cubiertos por `race-guard.test.ts`. El gap documentado en `review-7.md`.
+1. **`BACK-466` (borrado del backlog upstream):** Tests de regresión para la race condition de `loadAllData`, WS reconnect, y el dispatcher PowerShell. Los tests del dispatcher (`dispatch-ps1.test.ts`) ejercitan el path real de stdin. Los de race condition están cubiertos por `race-guard.test.ts`.
 
 2. **Flake ~10% en suite combinada** — `save-task-on-serialized.test.ts > supports async onSerialized callbacks` falla ocasionalmente en Windows por contención de fs cuando otros tests también escriben. En aislamiento pasa siempre. No introducido por el fork — es latencia de flush de Bun.write en Windows.
 
-3. **Tests de `Board.tsx` sin cobertura de `cleanupLaneKey`** — la lógica de deduplicar el cleanup en milestone mode es un branch inline pequeño. Refactorizar a helper puro lo haría testeable. Documentado en `review-14.md`.
+3. **Tests de `Board.tsx` sin cobertura de `cleanupLaneKey`** — la lógica de deduplicar el cleanup en milestone mode es un branch inline pequeño. Refactorizar a helper puro lo haría testeable.
 
-4. **`CardFieldsSection` y `BoardColumnsSection` sin tests de React** — los helpers puros (`buildBoardEditorRows`, `mergeBoardWith*`) sí están testeados, pero el wiring de estado dentro del componente no. El gap es aceptable por la cobertura de los helpers. Documentado en `review-16.md`.
-
----
-
-## Review history
-
-Cada feature pasó por rondas de revisión hasta APPROVE:
-
-| Rondas | Feature |
-|--------|---------|
-| review.md → review-4.md | Diseño de las 5 tasks (4 rondas, pre-implementación) |
-| review-5.md → review-7.md | Task #2 browser UI + hook hardening (3 rondas, APPROVE round 7) |
-| review-8.md → review-11.md | Task #3 file watcher (4 rondas, APPROVE round 11) |
-| review-12.md → review-14.md | Task #4 columnas configurables (3 rondas, APPROVE round 14) |
-| review-15.md → review-16.md | Task #5 card fields (2 rondas, APPROVE round 16) |
-
-Los archivos `review-N.md` en la raíz son el historial completo.
+4. **`CardFieldsSection` y `BoardColumnsSection` sin tests de React** — los helpers puros (`buildBoardEditorRows`, `mergeBoardWith*`) sí están testeados, pero el wiring de estado dentro del componente no. El gap es aceptable por la cobertura de los helpers.
 
 ---
 
