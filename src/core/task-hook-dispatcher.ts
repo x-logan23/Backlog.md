@@ -78,6 +78,19 @@ export interface TaskHookDispatcherOptions {
 	 * The watcher / browser server pass nothing and stay silent.
 	 */
 	onDispatch?: (event: { taskId: string; taskTitle: string; oldStatus: string; newStatus: string; success: boolean }) => void;
+	/**
+	 * Whether this process may fire the hook at all.
+	 *
+	 * Watching files and owning hook dispatch are two different jobs, and
+	 * conflating them is what made a non-authority server stop watching
+	 * entirely — leaving its task cache stale indefinitely behind a single
+	 * startup warning. With this gate a second server can keep watching (so
+	 * its reads stay fresh) while only the watcher-lock holder dispatches.
+	 *
+	 * Omitted means "always authoritative", which is the correct default for
+	 * the CLI and for a lone server.
+	 */
+	isAuthority?: () => Promise<boolean>;
 }
 
 export function createTaskHookDispatcher(options: TaskHookDispatcherOptions): TaskHookDispatcher {
@@ -158,6 +171,24 @@ export function createTaskHookDispatcher(options: TaskHookDispatcherOptions): Ta
 			if (prev === task.status) {
 				// Body, labels, or some other field changed — not a status
 				// transition.
+				return;
+			}
+			// Checked last, and only for a write that would otherwise fire.
+			//
+			// A process that is not the hook authority still watches files (it
+			// needs a fresh cache to answer API/MCP reads) but must never fire:
+			// the lock holder's watcher sees the same edit and dispatches for
+			// everyone. Without this gate, letting a second server keep its
+			// watcher would multi-fire onStatusChange on every hand edit — the
+			// failure the watcher lock exists to prevent.
+			//
+			// Order matters. Resolving authority can acquire the watcher lock,
+			// so asking before the cheap early-returns above would make the
+			// bulk-refresh path (which calls this for every task on a rename or
+			// a retry-exhausted reload, and is self-suppressing because the
+			// statuses match) take a lock for writes that were never going to
+			// fire anything.
+			if (options.isAuthority && !(await options.isAuthority())) {
 				return;
 			}
 			await fire(task, prev);

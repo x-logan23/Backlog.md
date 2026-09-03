@@ -373,14 +373,16 @@ export class BacklogServer {
 		} else {
 			console.warn(
 				"⚠️  Another Backlog.md process holds the watcher lock for this project. " +
-					"File-watcher-driven onStatusChange dispatch will be handled by that process; " +
-					"this server will respond to API/MCP requests but won't install its own watcher.",
+					"onStatusChange dispatch will be handled by that process; " +
+					"this server still watches files so its own reads stay current.",
 			);
-			this.core.setEnableWatchers(false);
-			// Suppress in-process hook fires — the lock holder's watcher will
-			// observe our writes and dispatch instead. Without this gate the
-			// hook would fire twice (once here from dispatchInProcess, once
-			// from the lock holder's watcher).
+			// Watchers stay ON deliberately. They serve two separate purposes —
+			// keeping this process's task cache fresh, and firing the hook — and
+			// only the second one may be duplicated. Turning them off to avoid a
+			// double dispatch also froze the cache, so every API/MCP consumer was
+			// served stale tasks indefinitely behind that one startup warning.
+			// Suppression now lives in the dispatcher's isAuthority gate instead,
+			// which covers the watcher path and the in-process path alike.
 			this.core.setHookDispatchAuthority(false);
 		}
 

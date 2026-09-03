@@ -235,6 +235,11 @@ export class Core {
 			loadConfig: () => this.fs.loadConfig(),
 			exec: executeStatusCallback,
 			onDispatch: options?.onStatusChangeDispatch,
+			// The watcher path consults this so a non-authority process can keep
+			// its file watchers (and therefore a fresh cache) without firing the
+			// hook a second time. The in-process path passes `suppress` directly
+			// in dispatchHookInProcess; both end up gated on the same answer.
+			isAuthority: () => this.resolveHookAuthority(),
 		});
 		// Note: Config is loaded lazily when needed since constructor can't be async
 	}
