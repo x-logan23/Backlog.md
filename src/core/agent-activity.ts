@@ -555,6 +555,35 @@ export function isLikelyRunning({
 	return silentMs < graceMs;
 }
 
+/** The three states a dispatch badge can be in. */
+export type AgentBadgeState = "running" | "stranded" | "completed";
+
+/**
+ * Collapse a resolved liveness into the one badge a card shows.
+ *
+ * Kept here rather than inline in the server so the card and the activity panel
+ * cannot drift into disagreeing about what the same dispatch is doing — a
+ * spinner on the card beside an "idle" pane is worse than either alone.
+ *
+ * "stranded" exists because the two honest failure modes look identical from
+ * outside: a session that died mid-turn without writing anything more, and a pid
+ * the OS handed to something else entirely. Both mean *a human should look*,
+ * which "completed" would quietly deny.
+ */
+export function deriveBadgeState({
+	running,
+	pidAlive,
+	statusMatches,
+}: {
+	running: boolean;
+	pidAlive: boolean;
+	statusMatches: boolean;
+}): AgentBadgeState {
+	if (running) return "running";
+	if (pidAlive && statusMatches) return "stranded";
+	return "completed";
+}
+
 /** Map an agent binary to the feed parser its output needs. */
 export function feedKindForBinary(binary: string): FeedKind {
 	const normalized = binary.toLowerCase();

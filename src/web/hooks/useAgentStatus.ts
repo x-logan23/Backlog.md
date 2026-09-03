@@ -3,6 +3,12 @@ import { useEffect, useState } from 'react';
 export interface AgentPhaseStatus {
 	running: boolean;
 	completed: boolean;
+	/**
+	 * The dispatch's pid is alive and the task has not moved on, but the log has
+	 * been silent past the grace window — neither working nor cleanly finished.
+	 * Usually a stranded session, sometimes just an OS-recycled pid.
+	 */
+	stranded: boolean;
 }
 
 export interface TaskAgentStatus {
@@ -19,6 +25,7 @@ interface ApiEntry {
 	status: string;
 	running: boolean;
 	completed: boolean;
+	stranded?: boolean;
 }
 
 // Module-level singleton — one polling interval shared across all TaskCard instances.
@@ -39,7 +46,11 @@ async function poll() {
 		const next: StatusMap = {};
 		for (const item of data) {
 			if (!next[item.taskId]) next[item.taskId] = {};
-			const phase: AgentPhaseStatus = { running: item.running, completed: item.completed };
+			const phase: AgentPhaseStatus = {
+				running: item.running,
+				completed: item.completed,
+				stranded: item.stranded ?? false,
+			};
 			const entry = next[item.taskId];
 			if (entry) {
 				if (item.status === 'In Progress') {

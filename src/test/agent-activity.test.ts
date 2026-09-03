@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	AgentFeedTail,
 	claudeProjectSlug,
+	deriveBadgeState,
 	extractSessionIds,
 	feedKindForBinary,
 	hopCount,
@@ -396,6 +397,37 @@ describe("isLikelyRunning", () => {
 
 	it("is false when the log could not be read at all", () => {
 		expect(isLikelyRunning({ pidAlive: true, statusMatches: true, silentMs: null })).toBe(false);
+	});
+});
+
+describe("deriveBadgeState", () => {
+	it("shows a spinner only for a corroborated running agent", () => {
+		expect(deriveBadgeState({ running: true, pidAlive: true, statusMatches: true })).toBe("running");
+	});
+
+	it("shows stranded when the pid is alive on the current phase but nothing is happening", () => {
+		expect(deriveBadgeState({ running: false, pidAlive: true, statusMatches: true })).toBe("stranded");
+	});
+
+	it("shows completed for a recycled pid on a task that already moved on", () => {
+		// The four real false positives all landed here: pid alive, task Done.
+		expect(deriveBadgeState({ running: false, pidAlive: true, statusMatches: false })).toBe("completed");
+	});
+
+	it("shows completed once the process is gone", () => {
+		expect(deriveBadgeState({ running: false, pidAlive: false, statusMatches: true })).toBe("completed");
+		expect(deriveBadgeState({ running: false, pidAlive: false, statusMatches: false })).toBe("completed");
+	});
+
+	it("never reports two states at once", () => {
+		for (const running of [true, false]) {
+			for (const pidAlive of [true, false]) {
+				for (const statusMatches of [true, false]) {
+					const state = deriveBadgeState({ running, pidAlive, statusMatches });
+					expect(["running", "stranded", "completed"]).toContain(state);
+				}
+			}
+		}
 	});
 });
 

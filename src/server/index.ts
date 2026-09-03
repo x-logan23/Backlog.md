@@ -7,6 +7,7 @@ import {
 	type AgentEvent,
 	AgentFeedTail,
 	claudeProjectSlug,
+	deriveBadgeState,
 	extractSessionIds,
 	feedKindForBinary,
 	type FeedKind,
@@ -1837,6 +1838,114 @@ export class BacklogServer {
 		}
 	}
 
+	/**
+	 * Newest dispatch per (taskId, status), from the `.pid` files dispatch.ps1
+	 * writes after Start-Process. Stems are timestamp-prefixed, so lexicographic
+	 * order is chronological.
+	 */
+	private latestDispatches(files: readonly string[]): Map<string, { stem: string; taskId: string; status: string }> {
+		const latest = new Map<string, { stem: string; taskId: string; status: string }>();
+		for (const file of files) {
+			const parsed = parseLogStem(file, ".log.pid");
+			if (!parsed) continue;
+			const key = `${parsed.taskId}::${parsed.status}`;
+			const previous = latest.get(key);
+			if (!previous || previous.stem.localeCompare(parsed.stem) < 0) latest.set(key, parsed);
+		}
+		return latest;
+	}
+
+	/**
+	 * Whether one dispatch is really still working.
+	 *
+	 * Shared by /api/agent-status and /api/agent-activity on purpose: a liveness
+	 * rule enforced in one of them is enforced in neither, and the two disagreeing
+	 * would mean a card spinning while its pane says idle. See `isLikelyRunning`
+	 * for why a live pid alone is not evidence of anything.
+	 */
+	private async resolveLiveness(
+		logsDir: string,
+		stem: string,
+		/**
+		 * Authoritative current status of the dispatch's task, read on demand.
+		 * Called ONLY when the pid resolves, because that is the only case where
+		 * the status changes the answer — which keeps the cost at a couple of file
+		 * reads per poll instead of one per historical dispatch.
+		 */
+		resolveTaskStatus: () => Promise<string | null>,
+	): Promise<{
+		pidAlive: boolean;
+		statusMatches: boolean;
+		silentMs: number | null;
+		running: boolean;
+		lastWriteMs: number | null;
+	}> {
+		let pid = 0;
+		try {
+			pid = Number.parseInt((await Bun.file(join(logsDir, `${stem}.log.pid`)).text()).trim(), 10);
+		} catch {
+			// .pid unreadable — pid stays 0, i.e. not alive
+		}
+
+		let pidAlive = false;
+		if (pid > 0) {
+			try {
+				process.kill(pid, 0);
+				pidAlive = true;
+			} catch (e: unknown) {
+				// EPERM = alive but not ours to signal; ESRCH = really gone.
+				pidAlive = (e as NodeJS.ErrnoException).code === "EPERM";
+			}
+		}
+
+		let silentMs: number | null = null;
+		let lastWriteMs: number | null = null;
+		try {
+			const stat = await Bun.file(join(logsDir, `${stem}.log`)).stat();
+			lastWriteMs = stat.mtimeMs;
+			silentMs = Math.max(0, Date.now() - stat.mtimeMs);
+		} catch {
+			// log gone — leave null rather than inventing a time
+		}
+
+		// No live pid means nothing is working, whatever the task status says.
+		if (!pidAlive) {
+			return { pidAlive: false, statusMatches: false, silentMs, lastWriteMs, running: false };
+		}
+
+		const dispatchStatus = await resolveTaskStatus();
+		const statusMatches = dispatchStatus !== null;
+		return {
+			pidAlive,
+			statusMatches,
+			silentMs,
+			lastWriteMs,
+			running: isLikelyRunning({ pidAlive, statusMatches, silentMs }),
+		};
+	}
+
+	/**
+	 * Read one task's status straight from disk.
+	 *
+	 * Deliberately not the cached content store: when another process holds the
+	 * watcher lock this server installs no watcher, so its cache can sit stale
+	 * indefinitely with only a startup warning. A liveness rule built on a stale
+	 * status reports agents working on tasks that finished hours ago — the exact
+	 * lie this whole change exists to remove.
+	 */
+	private async freshTaskStatus(taskId: string, cachedId?: string): Promise<string | null> {
+		for (const candidate of [cachedId, taskId]) {
+			if (!candidate) continue;
+			try {
+				const task = await this.core.filesystem.loadTask(candidate);
+				if (task) return task.status;
+			} catch {
+				// unreadable / not found — try the next spelling
+			}
+		}
+		return null;
+	}
+
 	private async handleGetAgentStatus(): Promise<Response> {
 		const logsDir = join(this.core.filesystem.backlogDir, "prompts", "logs");
 		let files: string[];
@@ -1846,54 +1955,34 @@ export class BacklogServer {
 			return Response.json([]);
 		}
 
-		// .pid files are written by dispatch.ps1 after Start-Process and contain the
-		// actual agent's PID. Their stem matches the corresponding .log filename stem.
-		// Format: {yyyyMMdd-HHmmss-fff}-{dispatchPID}-{safeTaskId}-{safeStatus}.log.pid
-		// Split by '-': [0]=date [1]=time [2]=ms [3]=dispatchPID [4..n-2]=taskId [n-1]=status
-		const parsed: Array<{ stem: string; taskId: string; status: string }> = [];
-		for (const file of files) {
-			if (!file.endsWith(".log.pid")) continue;
-			const stem = file.slice(0, -8); // strip ".log.pid"
-			const parts = stem.split("-");
-			if (parts.length < 6) continue;
-			const status = (parts[parts.length - 1] ?? "").replace(/_/g, " ");
-			const taskId = parts.slice(4, parts.length - 1).join("-");
-			if (!taskId) continue;
-			parsed.push({ stem, taskId, status });
-		}
-
-		// Keep most recent .pid per (taskId, status) — stems are timestamp-prefixed so
-		// lexicographic sort is chronological.
-		const byKey = new Map<string, (typeof parsed)[number]>();
-		for (const entry of parsed.sort((a, b) => a.stem.localeCompare(b.stem))) {
-			byKey.set(`${entry.taskId}::${entry.status}`, entry);
-		}
+		// The cached store only supplies the task's canonical id spelling; the
+		// status itself is read fresh (see freshTaskStatus) and only when needed.
+		const store = await this.getContentStoreInstance().catch(() => null);
+		const idById = new Map((store?.getTasks() ?? []).map((task) => [task.id.toLowerCase(), task.id]));
 
 		const result = await Promise.all(
-			Array.from(byKey.values()).map(async ({ stem, taskId, status }) => {
-				let pid = 0;
-				try {
-					const raw = await Bun.file(join(logsDir, `${stem}.log.pid`)).text();
-					pid = parseInt(raw.trim(), 10);
-				} catch {
-					// .pid file unreadable — treat as completed
-				}
-
-				let running = false;
-				let completed = false;
-				if (pid > 0) {
-					try {
-						process.kill(pid, 0);
-						running = true;
-					} catch (e: unknown) {
-						// ESRCH = not found (finished); EPERM = exists, no permission (still running)
-						running = (e as NodeJS.ErrnoException).code === "EPERM";
-						completed = (e as NodeJS.ErrnoException).code === "ESRCH";
-					}
-				} else {
-					completed = true; // .pid missing or unreadable → dispatch finished
-				}
-				return { taskId, status, running, completed };
+			Array.from(this.latestDispatches(files).values()).map(async ({ stem, taskId, status }) => {
+				const { pidAlive, statusMatches, silentMs, running } = await this.resolveLiveness(
+					logsDir,
+					stem,
+					async () => {
+						const current = await this.freshTaskStatus(taskId, idById.get(taskId.toLowerCase()));
+						return current === status ? current : null;
+					},
+				);
+				const badge = deriveBadgeState({ running, pidAlive, statusMatches });
+				return {
+					taskId,
+					status,
+					running: badge === "running",
+					// A live pid with a long-silent feed is neither running nor cleanly
+					// finished — it is the stranded-session signature, and flattening it
+					// into either one hides the thing worth seeing.
+					stranded: badge === "stranded",
+					completed: badge === "completed",
+					pidAlive,
+					silentMs,
+				};
 			}),
 		);
 
@@ -1991,45 +2080,17 @@ export class BacklogServer {
 		// directly, which is why the lookup falls back to the value itself.
 		const aliasToBinary = new Map((config?.agents ?? []).map((agent) => [agent.alias, agent.binary]));
 
-		// Most recent dispatch per (taskId, status). Stems are timestamp-prefixed,
-		// so lexicographic order is chronological.
-		const latest = new Map<string, { stem: string; taskId: string; status: string }>();
-		for (const file of files) {
-			const parsed = parseLogStem(file, ".log.pid");
-			if (!parsed) continue;
-			const previous = latest.get(`${parsed.taskId}::${parsed.status}`);
-			if (!previous || previous.stem.localeCompare(parsed.stem) < 0) {
-				latest.set(`${parsed.taskId}::${parsed.status}`, parsed);
-			}
-		}
-
 		const entries = await Promise.all(
-			Array.from(latest.values()).map(async ({ stem, taskId, status }) => {
+			Array.from(this.latestDispatches(files).values()).map(async ({ stem, taskId, status }) => {
 				const logPath = join(logsDir, `${stem}.log`);
-
-				let pid = 0;
-				try {
-					pid = Number.parseInt((await Bun.file(join(logsDir, `${stem}.log.pid`)).text()).trim(), 10);
-				} catch {
-					// unreadable .pid — treated as finished below
-				}
-
-				let pidAlive = false;
-				if (pid > 0) {
-					try {
-						process.kill(pid, 0);
-						pidAlive = true;
-					} catch (e: unknown) {
-						// EPERM = alive but not ours to signal; ESRCH = really gone.
-						pidAlive = (e as NodeJS.ErrnoException).code === "EPERM";
-					}
-				}
-
 				const task = taskById.get(taskId.toLowerCase());
-				const statusMatches = task?.status === status;
+
+				// Status is read fresh from disk, not taken from the cached store,
+				// which can sit stale when this server installed no watcher.
+				const currentStatus = await this.freshTaskStatus(taskId, task?.id);
 				// Drop historical dispatches — a task that has moved on is not being
 				// worked by this one, no matter what its recycled pid resolves to.
-				if (!statusMatches) return null;
+				if (currentStatus !== status) return null;
 
 				const phase = status === "In Progress" ? "coder" : status === "In Review" ? "reviewer" : "notifier";
 				const agentName = (phase === "reviewer" ? task?.reviewAgent || task?.agent : task?.agent) ?? "";
@@ -2060,24 +2121,29 @@ export class BacklogServer {
 				}
 
 				const feed = await this.readAgentFeed(feedPath, feedKind);
+				// Status was already confirmed fresh above, so the resolver is a
+				// constant here rather than a second read of the same file.
+				const liveness = await this.resolveLiveness(logsDir, stem, async () => status);
+				const pidAlive = liveness.pidAlive;
 
 				let startedAt: string | null = null;
 				let lastActivityAt: string | null = feed.lastEventAt ?? null;
-				let silentMs: number | null = null;
 				try {
 					const stat = await Bun.file(logPath).stat();
 					startedAt = new Date(stat.birthtimeMs || stat.mtimeMs).toISOString();
 					// Codex events carry no timestamps, so fall back to the file's mtime.
 					if (!lastActivityAt) lastActivityAt = new Date(stat.mtimeMs).toISOString();
-					// Measure silence from the newest of the two: a claude transcript can
-					// be moving while the (prose-only) dispatch log sits untouched.
-					const newest = Math.max(stat.mtimeMs, lastActivityAt ? Date.parse(lastActivityAt) : 0);
-					silentMs = Math.max(0, Date.now() - newest);
 				} catch {
 					// log file gone — leave these null rather than inventing a time
 				}
 
-				const running = isLikelyRunning({ pidAlive, statusMatches, silentMs });
+				// Measure silence from the newest of the two sources: a claude
+				// transcript can be moving while the (prose-only) dispatch log it was
+				// dispatched with sits untouched for the whole session.
+				const newestMs = Math.max(liveness.lastWriteMs ?? 0, lastActivityAt ? Date.parse(lastActivityAt) : 0);
+				const silentMs = newestMs > 0 ? Math.max(0, Date.now() - newestMs) : null;
+				// statusMatches is true by construction: a mismatch returned null above.
+				const running = isLikelyRunning({ pidAlive, statusMatches: true, silentMs });
 
 				const maxHops = 6; // dispatch.ps1 $maxRoundTrips
 				return {

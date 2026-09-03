@@ -35,6 +35,18 @@ const DoneIcon: React.FC<{ className?: string }> = ({ className = 'w-2.5 h-2.5' 
   </svg>
 );
 
+/**
+ * Pid alive, task still in this phase, but the log has gone quiet past the
+ * grace window. Distinct from both "running" and "done" on purpose: this is the
+ * stranded-session signature, and showing it as either would hide the one state
+ * that needs a human.
+ */
+const StrandedIcon: React.FC<{ className?: string }> = ({ className = 'w-2.5 h-2.5' }) => (
+  <svg className={`${className} text-amber-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-label="no output">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+  </svg>
+);
+
 const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEnd, status, laneId, hiddenFields = EMPTY_HIDDEN }) => {
   const [isDragging, setIsDragging] = React.useState(false);
   const [showBranchTooltip, setShowBranchTooltip] = React.useState(false);
@@ -197,8 +209,9 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
         {(!hiddenFields.has('agent') && task.agent) || (!hiddenFields.has('reviewAgent') && task.reviewAgent) ? (
           <div className="flex flex-wrap gap-1 mt-2">
             {!hiddenFields.has('agent') && task.agent && (() => {
-              const running = agentStatus.coder?.running;
-              const done    = agentStatus.coder?.completed;
+              const running  = agentStatus.coder?.running;
+              const done     = agentStatus.coder?.completed;
+              const stranded = agentStatus.coder?.stranded;
               return (
                 <span
                   role="button"
@@ -208,11 +221,11 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
                       ? 'bg-blue-100 dark:bg-blue-800/50 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-700/60'
                       : 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-800/40'
                   }`}
-                  title={`Coder agent: ${task.agent}${running ? ' (running)' : done ? ' (done)' : ''} — click to view log`}
+                  title={`Coder agent: ${task.agent}${running ? ' (running)' : stranded ? ' (no output — possibly stranded)' : done ? ' (done)' : ''} — click to view log`}
                   onClick={(e) => { e.stopPropagation(); setLogModal({ status: 'In Progress', agentName: task.agent! }); }}
                   onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); setLogModal({ status: 'In Progress', agentName: task.agent! }); } }}
                 >
-                  {running ? <SpinnerIcon /> : done ? <DoneIcon /> : (
+                  {running ? <SpinnerIcon /> : stranded ? <StrandedIcon /> : done ? <DoneIcon /> : (
                     <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                     </svg>
@@ -222,8 +235,9 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
               );
             })()}
             {!hiddenFields.has('reviewAgent') && task.reviewAgent && (() => {
-              const running = agentStatus.reviewer?.running;
-              const done    = agentStatus.reviewer?.completed;
+              const running  = agentStatus.reviewer?.running;
+              const done     = agentStatus.reviewer?.completed;
+              const stranded = agentStatus.reviewer?.stranded;
               return (
                 <span
                   role="button"
@@ -233,11 +247,11 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
                       ? 'bg-purple-100 dark:bg-purple-800/50 text-purple-800 dark:text-purple-200 hover:bg-purple-200 dark:hover:bg-purple-700/60'
                       : 'bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-800/40'
                   }`}
-                  title={`Reviewer agent: ${task.reviewAgent}${running ? ' (running)' : done ? ' (done)' : ''} — click to view log`}
+                  title={`Reviewer agent: ${task.reviewAgent}${running ? ' (running)' : stranded ? ' (no output — possibly stranded)' : done ? ' (done)' : ''} — click to view log`}
                   onClick={(e) => { e.stopPropagation(); setLogModal({ status: 'In Review', agentName: task.reviewAgent! }); }}
                   onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); setLogModal({ status: 'In Review', agentName: task.reviewAgent! }); } }}
                 >
-                  {running ? <SpinnerIcon /> : done ? <DoneIcon /> : (
+                  {running ? <SpinnerIcon /> : stranded ? <StrandedIcon /> : done ? <DoneIcon /> : (
                     <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
