@@ -1,7 +1,21 @@
 import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { $ } from "bun";
+import {
+	type AgentEvent,
+	AgentFeedTail,
+	claudeProjectSlug,
+	extractSessionIds,
+	feedKindForBinary,
+	type FeedKind,
+	hopCount,
+	isLikelyRunning,
+	parseLogStem,
+	safeSegment,
+	type TokenTotals,
+} from "../core/agent-activity.ts";
 import { Core } from "../core/backlog.ts";
 import type { ContentStore } from "../core/content-store.ts";
 import { initializeProject } from "../core/init.ts";
@@ -245,6 +259,15 @@ export class BacklogServer {
 	private storeReadyBroadcasted = false;
 	private configWatcher: { stop: () => void } | null = null;
 	private watcherLockHolder: WatcherLockHolder | null = null;
+	/**
+	 * Incremental tails for /api/agent-activity, keyed by absolute feed path.
+	 *
+	 * A coder's Claude transcript passes 10 MB within a session and the board
+	 * polls every few seconds; without this the server would re-read and re-parse
+	 * the whole file on every poll. Each entry remembers its byte offset, so a
+	 * poll only parses what was appended since the last one.
+	 */
+	private agentFeeds = new Map<string, AgentFeedTail>();
 
 	constructor(projectPath: string) {
 		this.core = new Core(projectPath, { enableWatchers: true });
@@ -476,6 +499,9 @@ export class BacklogServer {
 					},
 					"/api/agent-log": {
 						GET: async (req: Request) => await this.handleGetAgentLog(req),
+					},
+					"/api/agent-activity": {
+						GET: async () => await this.handleGetAgentActivity(),
 					},
 					"/api/init": {
 						POST: async (req: Request) => await this.handleInit(req),
@@ -1927,6 +1953,215 @@ export class BacklogServer {
 		} catch { /* no .pid → done */ }
 
 		return Response.json({ content: agentLogParse(raw, usedErr), done, logFile: matching });
+	}
+
+	/**
+	 * Structured live activity for every agent the dispatcher currently has out.
+	 *
+	 * This is the board-level companion to /api/agent-log: instead of one task's
+	 * raw text, it returns a normalized event stream, token totals, elapsed time
+	 * and loop-guard hop count for all active dispatches at once, so the UI can
+	 * show what each agent is doing without a request per card.
+	 *
+	 * The feed it reads depends on the agent, because they do not report equally:
+	 *   - claude is launched with plain `-p`, whose stdout is only the closing
+	 *     prose. The real record is Claude Code's own session transcript, so when
+	 *     the task recorded a session id we read that instead of the dispatch log.
+	 *   - codex is launched with `exec --json`, so its dispatch log is already a
+	 *     structured stream.
+	 *   - anything else falls back to the dispatch log as plain text.
+	 */
+	private async handleGetAgentActivity(): Promise<Response> {
+		const logsDir = join(this.core.filesystem.backlogDir, "prompts", "logs");
+		let files: string[];
+		try {
+			files = await readdir(logsDir);
+		} catch {
+			return Response.json([]);
+		}
+
+		const [config, store] = await Promise.all([
+			this.core.filesystem.loadConfig().catch(() => null),
+			this.getContentStoreInstance().catch(() => null),
+		]);
+		const tasks = store?.getTasks() ?? [];
+		const taskById = new Map(tasks.map((task) => [task.id.toLowerCase(), task]));
+
+		// Alias ("Claudio") -> binary ("claude"). A task may also name a binary
+		// directly, which is why the lookup falls back to the value itself.
+		const aliasToBinary = new Map((config?.agents ?? []).map((agent) => [agent.alias, agent.binary]));
+
+		// Most recent dispatch per (taskId, status). Stems are timestamp-prefixed,
+		// so lexicographic order is chronological.
+		const latest = new Map<string, { stem: string; taskId: string; status: string }>();
+		for (const file of files) {
+			const parsed = parseLogStem(file, ".log.pid");
+			if (!parsed) continue;
+			const previous = latest.get(`${parsed.taskId}::${parsed.status}`);
+			if (!previous || previous.stem.localeCompare(parsed.stem) < 0) {
+				latest.set(`${parsed.taskId}::${parsed.status}`, parsed);
+			}
+		}
+
+		const entries = await Promise.all(
+			Array.from(latest.values()).map(async ({ stem, taskId, status }) => {
+				const logPath = join(logsDir, `${stem}.log`);
+
+				let pid = 0;
+				try {
+					pid = Number.parseInt((await Bun.file(join(logsDir, `${stem}.log.pid`)).text()).trim(), 10);
+				} catch {
+					// unreadable .pid — treated as finished below
+				}
+
+				let pidAlive = false;
+				if (pid > 0) {
+					try {
+						process.kill(pid, 0);
+						pidAlive = true;
+					} catch (e: unknown) {
+						// EPERM = alive but not ours to signal; ESRCH = really gone.
+						pidAlive = (e as NodeJS.ErrnoException).code === "EPERM";
+					}
+				}
+
+				const task = taskById.get(taskId.toLowerCase());
+				const statusMatches = task?.status === status;
+				// Drop historical dispatches — a task that has moved on is not being
+				// worked by this one, no matter what its recycled pid resolves to.
+				if (!statusMatches) return null;
+
+				const phase = status === "In Progress" ? "coder" : status === "In Review" ? "reviewer" : "notifier";
+				const agentName = (phase === "reviewer" ? task?.reviewAgent || task?.agent : task?.agent) ?? "";
+				const agentBinary = aliasToBinary.get(agentName) ?? agentName;
+				const kind = feedKindForBinary(agentBinary);
+
+				// Prefer Claude's own transcript — the dispatch log for `claude -p`
+				// carries no tool calls at all.
+				const sessionIds = extractSessionIds(task?.rawContent ?? "");
+				const sessionId = (phase === "reviewer" ? sessionIds.reviewer : sessionIds.coder) ?? null;
+				let feedPath = logPath;
+				let source: "claude-transcript" | "codex-json" | "log-text" = kind === "codex" ? "codex-json" : "log-text";
+				// Without a transcript, a claude dispatch log is prose — read it as text.
+				let feedKind: FeedKind = kind === "claude" ? "text" : kind;
+				if (kind === "claude" && sessionId) {
+					const transcript = join(
+						homedir(),
+						".claude",
+						"projects",
+						claudeProjectSlug(this.core.filesystem.rootDir),
+						`${sessionId}.jsonl`,
+					);
+					if (await Bun.file(transcript).exists()) {
+						feedPath = transcript;
+						source = "claude-transcript";
+						feedKind = "claude";
+					}
+				}
+
+				const feed = await this.readAgentFeed(feedPath, feedKind);
+
+				let startedAt: string | null = null;
+				let lastActivityAt: string | null = feed.lastEventAt ?? null;
+				let silentMs: number | null = null;
+				try {
+					const stat = await Bun.file(logPath).stat();
+					startedAt = new Date(stat.birthtimeMs || stat.mtimeMs).toISOString();
+					// Codex events carry no timestamps, so fall back to the file's mtime.
+					if (!lastActivityAt) lastActivityAt = new Date(stat.mtimeMs).toISOString();
+					// Measure silence from the newest of the two: a claude transcript can
+					// be moving while the (prose-only) dispatch log sits untouched.
+					const newest = Math.max(stat.mtimeMs, lastActivityAt ? Date.parse(lastActivityAt) : 0);
+					silentMs = Math.max(0, Date.now() - newest);
+				} catch {
+					// log file gone — leave these null rather than inventing a time
+				}
+
+				const running = isLikelyRunning({ pidAlive, statusMatches, silentMs });
+
+				const maxHops = 6; // dispatch.ps1 $maxRoundTrips
+				return {
+					taskId,
+					taskTitle: task?.title ?? "",
+					status,
+					phase,
+					agentName,
+					agentBinary,
+					running,
+					// Surfaced separately on purpose: "pid alive but silent for hours" is
+					// the stranded-session signature, and must not be flattened away.
+					pidAlive,
+					silentMs,
+					startedAt,
+					lastActivityAt,
+					hop: hopCount(files, safeSegment(taskId)),
+					maxHops,
+					tokens: feed.tokens,
+					tokensPartial: feed.partial,
+					events: feed.events,
+					sessionId,
+					source,
+					logFile: `${stem}.log`,
+				};
+			}),
+		);
+
+		const active = entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+		// Running agents first, then most recently active.
+		active.sort((a, b) => {
+			if (a.running !== b.running) return a.running ? -1 : 1;
+			return (b.lastActivityAt ?? "").localeCompare(a.lastActivityAt ?? "");
+		});
+		return Response.json(active);
+	}
+
+	/**
+	 * Read whatever was appended to one agent feed since the last poll.
+	 *
+	 * A feed that has grown smaller than our offset was rotated or truncated
+	 * (a re-dispatch reusing the path), so the tail is reset rather than fed a
+	 * mid-file byte range that would parse as garbage.
+	 */
+	private async readAgentFeed(
+		path: string,
+		kind: FeedKind,
+	): Promise<{ events: AgentEvent[]; tokens: TokenTotals | null; lastEventAt?: string; partial: boolean }> {
+		let tail = this.agentFeeds.get(path);
+		if (!tail) {
+			tail = new AgentFeedTail(kind);
+			this.agentFeeds.set(path, tail);
+		}
+
+		let partial = false;
+		try {
+			const file = Bun.file(path);
+			const size = file.size;
+			if (size < tail.offset) tail.reset();
+
+			// First attach to an already-huge transcript: skip to the tail instead of
+			// parsing megabytes the user will never scroll to. Token totals are then
+			// only for the part we read, which `partial` tells the UI to say out loud
+			// rather than showing a confidently wrong number.
+			const MAX_INITIAL = 8 * 1024 * 1024;
+			if (tail.offset === 0 && size > MAX_INITIAL) {
+				tail.skipTo(size - MAX_INITIAL);
+				partial = true;
+			}
+
+			if (size > tail.offset) {
+				const chunk = await file.slice(tail.offset, size).text();
+				tail.push(chunk, size - tail.offset);
+			}
+		} catch {
+			// Unreadable feed (deleted, locked): keep whatever we already parsed.
+		}
+
+		return {
+			events: tail.recentEvents(40),
+			tokens: tail.tokenTotals().total > 0 ? tail.tokenTotals() : null,
+			lastEventAt: tail.lastEventAt(),
+			partial,
+		};
 	}
 
 	private async handleInit(req: Request): Promise<Response> {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import Board from './Board';
+import LiveAgentPanel from './LiveAgentPanel';
 import { type BoardColumnConfig, type ConfigurableCardField, type Milestone, type Task } from '../../types';
 import { type LaneMode } from '../lib/lanes';
 
@@ -124,6 +125,7 @@ export default function BoardPage({
 
 	return (
 		<div className="container mx-auto px-4 py-8 transition-colors duration-200">
+			<LiveAgentPanel />
 			<Board
 				onEditTask={handleEditTask}
 				onNewTask={onNewTask}
