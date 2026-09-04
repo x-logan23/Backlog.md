@@ -27,8 +27,26 @@ function formatTokens(n: number): string {
 	return String(n);
 }
 
-const EVENT_STYLES: Record<AgentEvent['kind'], string> = {
-	tool: 'text-sky-700 dark:text-sky-300',
+/**
+ * Events render as a label line above a full-width detail line rather than as
+ * two columns. The label column was a fixed 6rem: mostly empty for `shell`,
+ * still too narrow for `backlog.get_backlog_instructions`, and it cost every
+ * detail line that width — the one thing in the pane actually worth reading.
+ *
+ * The label carries the semantic colour (it says what KIND of thing happened);
+ * the detail stays in a calm body colour so a wall of output is readable, with
+ * errors the deliberate exception.
+ */
+const LABEL_STYLES: Record<AgentEvent['kind'], string> = {
+	tool: 'text-sky-600 dark:text-sky-400',
+	message: 'text-gray-400 dark:text-gray-500',
+	result: 'text-gray-400 dark:text-gray-600',
+	error: 'text-red-600 dark:text-red-400',
+	system: 'text-gray-400 dark:text-gray-600',
+};
+
+const DETAIL_STYLES: Record<AgentEvent['kind'], string> = {
+	tool: 'text-gray-700 dark:text-gray-200',
 	message: 'text-gray-700 dark:text-gray-300',
 	result: 'text-gray-500 dark:text-gray-500',
 	error: 'text-red-600 dark:text-red-400',
@@ -164,23 +182,34 @@ const AgentPane: React.FC<{
 				</div>
 			)}
 
-			{/* Event stream — newest last, matching how a terminal reads. */}
+			{/* Event stream — newest last, matching how a terminal reads. Taller than
+			    the old two-column layout needed, because stacking the label costs a
+			    line per event and roughly the same number should stay visible. */}
 			<div
 				ref={scrollRef}
 				onScroll={handleScroll}
-				className="flex-1 min-h-0 max-h-56 overflow-y-auto px-3 py-2 space-y-0.5 font-mono text-[11px] leading-relaxed"
+				className="flex-1 min-h-0 max-h-72 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed"
 			>
 				{events.length === 0 ? (
 					<div className="text-gray-400 dark:text-gray-600">(no output yet)</div>
 				) : (
-					events.map((event, index) => (
-						<div key={`${event.at ?? ''}-${index}`} className="flex gap-2">
-							<span className="text-gray-400 dark:text-gray-600 shrink-0 w-24 truncate" title={event.label}>
-								{event.label}
-							</span>
-							<span className={`${EVENT_STYLES[event.kind]} break-all`}>{event.detail}</span>
-						</div>
-					))
+					events.map((event, index) => {
+						// A run of the same kind of event reads as one block: repeating
+						// "shell" above every command in a five-command sequence is noise,
+						// and the label is only informative where it changes.
+						const previous = events[index - 1];
+						const startsRun = !previous || previous.label !== event.label || previous.kind !== event.kind;
+						return (
+							<div key={`${event.at ?? ''}-${index}`} className={startsRun && index > 0 ? 'pt-1.5' : undefined}>
+								{startsRun && (
+									<div className={`text-[10px] tracking-wide ${LABEL_STYLES[event.kind]}`}>{event.label}</div>
+								)}
+								<div className={`${DETAIL_STYLES[event.kind]} break-words whitespace-pre-wrap`}>
+									{event.detail}
+								</div>
+							</div>
+						);
+					})
 				)}
 			</div>
 		</div>
