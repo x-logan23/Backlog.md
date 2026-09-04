@@ -276,8 +276,12 @@ const LiveAgentPanel: React.FC = () => {
 					</span>
 				)}
 
+				{/* Sits with the other panel controls, NOT pushed right with ml-auto:
+				    the board is full-bleed now, so the far edge is metres of screen
+				    away from the panes on a wide monitor and the control reads as
+				    missing entirely. */}
 				<label
-					className="ml-auto flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-400 cursor-pointer select-none"
+					className="ml-3 flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-400 cursor-pointer select-none"
 					title="Follow the newest output. Scrolling a pane up turns this off; tick it again to jump back to the end."
 				>
 					<input
