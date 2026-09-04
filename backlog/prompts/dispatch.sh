@@ -15,6 +15,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 prompts_dir="$script_dir"
 project_root="$(cd "$script_dir/../.." && pwd)"
 
+# ── Atomic file claim ─────────────────────────────────────────────────────────
+# The Windows dispatcher gets this from File::Open with CreateNew. The POSIX
+# equivalent is `set -C` (noclobber), under which `> file` fails if the file
+# already exists — the check and the create happen in one syscall (O_EXCL), so
+# exactly one racing process can ever win. A plain `[ -f ] && ...` test would be
+# a TOCTOU race and defeat the entire point of these guards.
+claim_file() {
+    if (set -C; : > "$1") 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # Set BACKLOG_DISPATCH_MODE=test in the env that launches Backlog.md to pick
 # the smoke-test prompts (no-op agents that just wait and transition to the
 # next status). Anything else uses the real prompts.
@@ -22,6 +35,54 @@ if [ "${BACKLOG_DISPATCH_MODE:-}" = "test" ]; then
     suffix=".test.md"
 else
     suffix=".md"
+fi
+
+# ── Testing status: hand off to the project's own test runner ─────────────────
+# OPT-IN, and not part of the default pipeline: a `Testing` column with no runner
+# behind it strands every task that enters it. To use it, add "Testing" to
+# `statuses:` in backlog/config.yml between In Progress and In Review, drop a
+# `run-full-suite.sh` next to this file, and have your coder prompt move finished
+# work to `Testing` instead of straight to `In Review`.
+#
+# The runner is project-specific — it knows how your suite boots — so none ships
+# here. Its contract: invoked as `run-full-suite.sh <taskId> <projectRoot>`, runs
+# detached for as long as it needs, and reports back through the backlog CLI
+# (all green -> In Review; any red -> In Progress with the failure in the notes).
+# A red result landing back in In Progress is picked up as a coder rework below.
+if [ "${NEW_STATUS:-}" = "Testing" ]; then
+    test_log_dir="$prompts_dir/logs"
+    mkdir -p "$test_log_dir"
+    test_runner="$prompts_dir/run-full-suite.sh"
+    safe_test_task_id="$(printf '%s' "${TASK_ID:-unknown}" | tr -c 'A-Za-z0-9._-' '_')"
+
+    if [ ! -f "$test_runner" ]; then
+        # Say so loudly: silence here looks exactly like a passing gate, and the
+        # task would sit in Testing forever with nobody able to tell why.
+        echo "dispatch.sh: task ${TASK_ID:-?} entered 'Testing' but no run-full-suite.sh exists next to this script." >&2
+        echo "dispatch.sh: it will sit there until a human moves it. Add a runner, or drop 'Testing' from statuses in backlog/config.yml." >&2
+        exit 0
+    fi
+
+    test_lock="$test_log_dir/$safe_test_task_id-Testing.dedup"
+    if [ -f "$test_lock" ]; then
+        test_lock_mtime="$(date -r "$test_lock" +%s 2>/dev/null || echo 0)"
+        if [ "$test_lock_mtime" -gt 0 ] && [ $(( $(date +%s) - test_lock_mtime )) -gt 90 ]; then
+            rm -f "$test_lock" 2>/dev/null || true
+        fi
+    fi
+    if ! claim_file "$test_lock"; then
+        echo "dispatch.sh: duplicate Testing dispatch suppressed for ${TASK_ID:-?} (within 90s dedup window)"
+        exit 0
+    fi
+
+    test_stamp="$(date +%Y%m%d-%H%M%S-%3N)"
+    test_log="$test_log_dir/$test_stamp-$$-$safe_test_task_id-Testing.log"
+    echo "dispatch.sh: task=${TASK_ID:-?} status=Testing -- launching run-full-suite.sh detached"
+    (
+        cd "$project_root"
+        nohup sh "$test_runner" "${TASK_ID:-}" "$project_root" > "$test_log" 2> "$test_log.err" &
+    ) >/dev/null 2>&1
+    exit 0
 fi
 
 case "${NEW_STATUS:-}" in
@@ -58,19 +119,6 @@ printf '%s' "$full_prompt" > "$prompt_path"
 if [ "${BACKLOG_DISPATCH_DRY_RUN:-}" = "1" ]; then
     exit 0
 fi
-
-# ── Atomic file claim ─────────────────────────────────────────────────────────
-# The Windows dispatcher gets this from File::Open with CreateNew. The POSIX
-# equivalent is `set -C` (noclobber), under which `> file` fails if the file
-# already exists — the check and the create happen in one syscall (O_EXCL), so
-# exactly one racing process can ever win. A plain `[ -f ] && ...` test would be
-# a TOCTOU race and defeat the entire point of these guards.
-claim_file() {
-    if (set -C; : > "$1") 2>/dev/null; then
-        return 0
-    fi
-    return 1
-}
 
 # ── Deduplication guard ───────────────────────────────────────────────────────
 # The onStatusChange hook can fire more than once for the same event when the

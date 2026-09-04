@@ -26,6 +26,28 @@ Both dispatchers share these, and each exists because of a specific failure:
 
 Reset a fenced task with `rm backlog/prompts/logs/<TASK-ID>.hop-*` (or the PowerShell equivalent) once you've re-scoped, reassigned, or split it.
 
+## Optional: an automated test gate (`Testing`)
+
+Both dispatchers understand a `Testing` status between `In Progress` and `In Review`, so a suite runs on every branch before a reviewer ever looks at it. It is **opt-in and off by default**, because a `Testing` column with nothing behind it strands every task that enters it. To turn it on:
+
+1. add `"Testing"` to `statuses:` in `backlog/config.yml`, between `In Progress` and `In Review`;
+2. drop a `run-full-suite.ps1` (Windows) or `run-full-suite.sh` (POSIX) next to the dispatcher;
+3. change your `code.md` so the coder's terminal state is `Testing`, not `In Review`.
+
+No runner ships here — it has to know how your suite boots. What it must honour is the contract:
+
+| | |
+|---|---|
+| **Invoked as** | `run-full-suite.ps1 -TaskId <id> -ProjectRoot <path>` · `run-full-suite.sh <taskId> <projectRoot>` |
+| **Runs** | detached, for as long as it needs — the dispatcher does not wait, and no agent session is blocked on it |
+| **On success** | move the task to `In Review` and append a pass summary |
+| **On failure** | move it back to `In Progress`, with the failing part and a log excerpt in the notes |
+| **Annotating only** | append notes *without* a status change, so a note can never re-trigger the hook |
+
+A red run landing the task back in `In Progress` is recognised by its `OLD_STATUS=Testing` signature and **resumes the coder's existing session** rather than starting a fresh one that has never seen the failure.
+
+If the status fires with no runner present, the dispatcher warns loudly and stops rather than passing silently — a silent skip is indistinguishable from a green gate.
+
 ## Prerequisites
 
 1. **Claude Code CLI on PATH** — `claude --version` should work in the shell the dispatcher uses. The dispatchers run `claude -p <prompt> --dangerously-skip-permissions` headless. Drop `--dangerously-skip-permissions` from the dispatcher if you'd rather review every tool call (each hook fire will then block waiting for your input — defeats the point of the loop).

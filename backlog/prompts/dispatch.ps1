@@ -24,6 +24,92 @@ $promptsDir = $scriptDir
 # affects the environment of the agents launched below.
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
+# ── Testing status: hand off to the project's own test runner ─────────────────
+# OPT-IN. This status is not in the default pipeline, because a `Testing` column
+# with no runner behind it strands every task that enters it. To use it:
+#
+#   1. add "Testing" to `statuses:` in backlog/config.yml, between In Progress
+#      and In Review;
+#   2. drop a `run-full-suite.ps1` next to this file;
+#   3. tell your coder prompt to move finished work to `Testing` rather than
+#      straight to `In Review`.
+#
+# The runner is necessarily project-specific — it knows how your suite boots —
+# so none ships here. Its CONTRACT is what matters:
+#
+#   * invoked as: run-full-suite.ps1 -TaskId <id> -ProjectRoot <path>
+#   * runs detached and may take as long as it needs; nothing waits on it
+#   * reports back through the backlog CLI itself:
+#       all green -> status In Review,  notes: a pass summary
+#       any red   -> status In Progress, notes: which leg failed + a log excerpt
+#   * appends notes WITHOUT -s/--status when it only wants to annotate, so a note
+#     can never re-trigger this hook
+#
+# A red result landing the task back in In Progress is picked up below as
+# $isTestFailureRetry, which resumes the coder's session rather than starting a
+# fresh one that has never seen the failure.
+#
+# Isolated from the agent-dispatch path on purpose: no prompt file, no agent
+# binary, no session to resume. This branch only dedupes, launches, and exits.
+if ($env:NEW_STATUS -eq 'Testing') {
+    $testLogDir = Join-Path $PSScriptRoot 'logs'
+    if (-not (Test-Path $testLogDir)) { New-Item -ItemType Directory -Path $testLogDir | Out-Null }
+    $safeTestTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
+    if (-not $safeTestTaskId) { $safeTestTaskId = 'unknown' }
+
+    $testRunnerScript = Join-Path $PSScriptRoot 'run-full-suite.ps1'
+    if (-not (Test-Path $testRunnerScript)) {
+        # Say so loudly. Silence here looks exactly like a passing gate, and the
+        # task would sit in Testing forever with nobody able to tell why.
+        Write-Warning "dispatch.ps1: task $env:TASK_ID entered 'Testing' but no run-full-suite.ps1 exists next to this script."
+        Write-Warning "dispatch.ps1: it will sit there until a human moves it. Add a runner, or drop 'Testing' from statuses in backlog/config.yml."
+        exit 0
+    }
+
+    # Same dedup shape as the agent path: key on (taskId, status) only, decide
+    # staleness by file age, and claim atomically.
+    $testDedupeTtlSeconds = 90
+    $testDedupeLock = Join-Path $testLogDir "$safeTestTaskId-Testing.dedup"
+    try {
+        $testLockItem = Get-Item $testDedupeLock -ErrorAction SilentlyContinue
+        if ($null -ne $testLockItem) {
+            $lockAge = (Get-Date) - $testLockItem.LastWriteTime
+            if ($lockAge.TotalSeconds -gt $testDedupeTtlSeconds) {
+                Remove-Item $testDedupeLock -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Host "dispatch.ps1: stale Testing-lock check skipped ($($_.Exception.Message))"
+    }
+    try {
+        $s = [System.IO.File]::Open($testDedupeLock,
+                 [System.IO.FileMode]::CreateNew,
+                 [System.IO.FileAccess]::ReadWrite,
+                 [System.IO.FileShare]::None)
+        $s.Close()
+    } catch {
+        Write-Host "dispatch.ps1: duplicate Testing dispatch suppressed for $env:TASK_ID (within ${testDedupeTtlSeconds}s dedup window)"
+        exit 0
+    }
+
+    $testProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    $testStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $testLogFile = Join-Path $testLogDir "$testStamp-$PID-$safeTestTaskId-Testing.log"
+
+    Write-Host "dispatch.ps1: task=$env:TASK_ID status=Testing -- launching run-full-suite.ps1 detached"
+    Start-Process `
+        -FilePath 'powershell.exe' `
+        -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testRunnerScript,
+            '-TaskId', $env:TASK_ID, '-ProjectRoot', $testProjectRoot
+        ) `
+        -RedirectStandardOutput $testLogFile `
+        -RedirectStandardError "$testLogFile.err" `
+        -WindowStyle Hidden `
+        -WorkingDirectory $testProjectRoot
+    exit 0
+}
+
 # ── Prompt file selection ────────────────────────────────────────────────────
 if ($env:NEW_STATUS -eq 'In Progress') {
     $promptStem = 'code'
@@ -508,7 +594,20 @@ if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
     }
 }
 
-$isCoderRework = $isPostReviewRework -or $isStrandedRetry
+# A third rework case: the project's test runner (Testing status, above) found a
+# red leg and bounced the task back here itself. This is neither a review verdict
+# nor a stranded-session retry — it has its own signature, OLD_STATUS=Testing —
+# but it should resume the coder's session the same way, because the failure log
+# was just appended to the task notes and the coder needs that context.
+$isTestFailureRetry = $false
+if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
+    $env:OLD_STATUS -eq 'Testing' -and
+    $env:NEW_STATUS -eq 'In Progress' -and
+    $coderSessionId -ne '') {
+    $isTestFailureRetry = $true
+}
+
+$isCoderRework = $isPostReviewRework -or $isStrandedRetry -or $isTestFailureRetry
 
 $isReviewerResume = $false
 if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
@@ -518,7 +617,9 @@ if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
 }
 
 if ($isCoderRework) {
-    if ($isStrandedRetry) {
+    if ($isTestFailureRetry) {
+        $reworkMessage = "The automated test runner found a failing suite on task $env:TASK_ID and bounced it back to you. Read the task via the Backlog.md MCP (task_view) and find the latest run's notes -- they name what failed and include a log excerpt. Fix the failure, then move the task to Testing again (NOT In Review directly) so the suite re-runs. Do not try to run the full suite yourself; scoped/targeted tests are fine for fast iteration."
+    } elseif ($isStrandedRetry) {
         $reworkMessage = "Your previous session on task $env:TASK_ID was interrupted before finishing (e.g. a provider usage/rate limit) and no implementation was committed. Read the task via the Backlog.md MCP (task_view) and resume from where you left off -- you may already have useful context on the codebase in this session. Finish the implementation, run the tests, commit, and move the task to In Review when done."
     } else {
         $reworkMessage = "The reviewer requested changes on task $env:TASK_ID. Read the task via the Backlog.md MCP (task_view), find the latest Review section with CHANGES REQUESTED, address every finding, run the tests, and move the task back to In Review when done."
