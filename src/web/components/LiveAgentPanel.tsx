@@ -73,13 +73,7 @@ function useNow(active: boolean): number {
 /** Distance from the bottom still treated as "pinned", in px. */
 const AT_BOTTOM_SLACK = 24;
 
-const AgentPane: React.FC<{
-	activity: AgentActivity;
-	now: number;
-	autoScroll: boolean;
-	/** Called when the reader scrolls this pane away from the newest event. */
-	onScrolledAway: () => void;
-}> = ({ activity, now, autoScroll, onScrolledAway }) => {
+const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activity, now }) => {
 	const {
 		taskId,
 		taskTitle,
@@ -99,6 +93,15 @@ const AgentPane: React.FC<{
 	} = activity;
 
 	const scrollRef = useRef<HTMLDivElement>(null);
+
+	// Per-pane, because following one agent and reading back through another's
+	// history are things you do at the same time — a single shared toggle meant
+	// scrolling up in one pane stopped every other pane from following.
+	//
+	// Session-only, deliberately: panes come and go with the tasks they belong to,
+	// so persisting a per-pane choice would leave stale entries keyed to tasks that
+	// finished days ago. Every pane starts following.
+	const [autoScroll, setAutoScroll] = useState(true);
 
 	// Re-pin whenever the newest event changes. Keyed on the last event's identity
 	// rather than on events.length, because the feed is a ring buffer: once a pane
@@ -122,7 +125,7 @@ const AgentPane: React.FC<{
 		const el = scrollRef.current;
 		if (!el) return;
 		const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_SLACK;
-		if (!atBottom) onScrolledAway();
+		if (!atBottom) setAutoScroll(false);
 	};
 
 	const elapsed = startedAt ? now - Date.parse(startedAt) : null;
@@ -174,6 +177,21 @@ const AgentPane: React.FC<{
 					hop {hop}/{maxHops}
 				</span>
 				<span className="text-gray-400 dark:text-gray-600">{SOURCE_LABEL[source]}</span>
+
+				{/* Lives with this pane's own metrics, so the control governing the
+				    scroll is beside the thing that scrolls. */}
+				<label
+					className="ml-auto flex items-center gap-1 cursor-pointer select-none hover:text-gray-700 dark:hover:text-gray-300"
+					title="Follow this pane's newest output. Scrolling up turns it off; tick it again to jump back to the end."
+				>
+					<input
+						type="checkbox"
+						checked={autoScroll}
+						onChange={(event) => setAutoScroll(event.target.checked)}
+						className="w-3 h-3 rounded border-gray-300 dark:border-gray-600 accent-green-600 dark:accent-green-500 cursor-pointer"
+					/>
+					follow
+				</label>
 			</div>
 
 			{stranded && (
@@ -216,33 +234,11 @@ const AgentPane: React.FC<{
 	);
 };
 
-const AUTOSCROLL_KEY = 'backlog.agents.autoscroll';
-
 const LiveAgentPanel: React.FC = () => {
 	const activity = useAgentActivity();
 	const [collapsed, setCollapsed] = useState(false);
 	const anyRunning = activity.some((entry) => entry.running);
 	const now = useNow(activity.length > 0);
-
-	// Defaults to on: a live feed you have to chase is worse than one you have to
-	// pause. Persisted because re-ticking it on every reload is exactly the kind of
-	// small tax that makes a panel annoying to leave open.
-	const [autoScroll, setAutoScroll] = useState<boolean>(() => {
-		try {
-			return window.localStorage.getItem(AUTOSCROLL_KEY) !== 'false';
-		} catch {
-			return true;
-		}
-	});
-
-	const changeAutoScroll = (next: boolean) => {
-		setAutoScroll(next);
-		try {
-			window.localStorage.setItem(AUTOSCROLL_KEY, String(next));
-		} catch {
-			// Private window or blocked storage — the toggle still works this session.
-		}
-	};
 
 	// Nothing dispatched: render nothing rather than an empty shell above the board.
 	if (activity.length === 0) return null;
@@ -275,35 +271,12 @@ const LiveAgentPanel: React.FC = () => {
 						{activity.length - runningCount} idle
 					</span>
 				)}
-
-				{/* Sits with the other panel controls, NOT pushed right with ml-auto:
-				    the board is full-bleed now, so the far edge is metres of screen
-				    away from the panes on a wide monitor and the control reads as
-				    missing entirely. */}
-				<label
-					className="ml-3 flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-400 cursor-pointer select-none"
-					title="Follow the newest output. Scrolling a pane up turns this off; tick it again to jump back to the end."
-				>
-					<input
-						type="checkbox"
-						checked={autoScroll}
-						onChange={(event) => changeAutoScroll(event.target.checked)}
-						className="w-3.5 h-3.5 rounded border-gray-300 dark:border-gray-600 accent-green-600 dark:accent-green-500 cursor-pointer"
-					/>
-					Auto-scroll
-				</label>
 			</div>
 
 			{!collapsed && (
 				<div className="grid gap-3 grid-cols-1 lg:grid-cols-2 xl:grid-cols-3">
 					{activity.map((entry) => (
-						<AgentPane
-							key={`${entry.taskId}-${entry.status}`}
-							activity={entry}
-							now={now}
-							autoScroll={autoScroll}
-							onScrolledAway={() => changeAutoScroll(false)}
-						/>
+						<AgentPane key={`${entry.taskId}-${entry.status}`} activity={entry} now={now} />
 					))}
 				</div>
 			)}
