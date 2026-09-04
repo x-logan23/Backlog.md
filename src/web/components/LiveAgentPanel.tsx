@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { type AgentActivity, type AgentEvent, useAgentActivity } from '../hooks/useAgentActivity';
 
 /**
@@ -52,7 +52,16 @@ function useNow(active: boolean): number {
 	return now;
 }
 
-const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activity, now }) => {
+/** Distance from the bottom still treated as "pinned", in px. */
+const AT_BOTTOM_SLACK = 24;
+
+const AgentPane: React.FC<{
+	activity: AgentActivity;
+	now: number;
+	autoScroll: boolean;
+	/** Called when the reader scrolls this pane away from the newest event. */
+	onScrolledAway: () => void;
+}> = ({ activity, now, autoScroll, onScrolledAway }) => {
 	const {
 		taskId,
 		taskTitle,
@@ -70,6 +79,33 @@ const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activit
 		events,
 		source,
 	} = activity;
+
+	const scrollRef = useRef<HTMLDivElement>(null);
+
+	// Re-pin whenever the newest event changes. Keyed on the last event's identity
+	// rather than on events.length, because the feed is a ring buffer: once a pane
+	// reaches its cap the length stops changing while the content keeps moving.
+	const last = events[events.length - 1];
+	const newestKey = `${events.length}|${last?.at ?? ''}|${last?.label ?? ''}|${last?.detail ?? ''}`;
+
+	useEffect(() => {
+		if (!autoScroll) return;
+		const el = scrollRef.current;
+		if (el) el.scrollTop = el.scrollHeight;
+	}, [autoScroll, newestKey]);
+
+	// Turning autoscroll off is the reader's decision, so infer it from where they
+	// left the viewport rather than from the scroll event itself: our own
+	// scroll-to-bottom fires this handler too, and a naive "any scroll disables it"
+	// would switch the checkbox off the instant a new event arrived. Landing at the
+	// bottom — however we got there — is never a reason to disengage.
+	const handleScroll = () => {
+		if (!autoScroll) return;
+		const el = scrollRef.current;
+		if (!el) return;
+		const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_SLACK;
+		if (!atBottom) onScrolledAway();
+	};
 
 	const elapsed = startedAt ? now - Date.parse(startedAt) : null;
 	const quiet = silentMs !== null && silentMs > AGENT_SILENT_WARN_MS;
@@ -129,7 +165,11 @@ const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activit
 			)}
 
 			{/* Event stream — newest last, matching how a terminal reads. */}
-			<div className="flex-1 min-h-0 max-h-56 overflow-y-auto px-3 py-2 space-y-0.5 font-mono text-[11px] leading-relaxed">
+			<div
+				ref={scrollRef}
+				onScroll={handleScroll}
+				className="flex-1 min-h-0 max-h-56 overflow-y-auto px-3 py-2 space-y-0.5 font-mono text-[11px] leading-relaxed"
+			>
 				{events.length === 0 ? (
 					<div className="text-gray-400 dark:text-gray-600">(no output yet)</div>
 				) : (
@@ -147,11 +187,33 @@ const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activit
 	);
 };
 
+const AUTOSCROLL_KEY = 'backlog.agents.autoscroll';
+
 const LiveAgentPanel: React.FC = () => {
 	const activity = useAgentActivity();
 	const [collapsed, setCollapsed] = useState(false);
 	const anyRunning = activity.some((entry) => entry.running);
 	const now = useNow(activity.length > 0);
+
+	// Defaults to on: a live feed you have to chase is worse than one you have to
+	// pause. Persisted because re-ticking it on every reload is exactly the kind of
+	// small tax that makes a panel annoying to leave open.
+	const [autoScroll, setAutoScroll] = useState<boolean>(() => {
+		try {
+			return window.localStorage.getItem(AUTOSCROLL_KEY) !== 'false';
+		} catch {
+			return true;
+		}
+	});
+
+	const changeAutoScroll = (next: boolean) => {
+		setAutoScroll(next);
+		try {
+			window.localStorage.setItem(AUTOSCROLL_KEY, String(next));
+		} catch {
+			// Private window or blocked storage — the toggle still works this session.
+		}
+	};
 
 	// Nothing dispatched: render nothing rather than an empty shell above the board.
 	if (activity.length === 0) return null;
@@ -184,12 +246,31 @@ const LiveAgentPanel: React.FC = () => {
 						{activity.length - runningCount} idle
 					</span>
 				)}
+
+				<label
+					className="ml-auto flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-400 cursor-pointer select-none"
+					title="Follow the newest output. Scrolling a pane up turns this off; tick it again to jump back to the end."
+				>
+					<input
+						type="checkbox"
+						checked={autoScroll}
+						onChange={(event) => changeAutoScroll(event.target.checked)}
+						className="w-3.5 h-3.5 rounded border-gray-300 dark:border-gray-600 accent-green-600 dark:accent-green-500 cursor-pointer"
+					/>
+					Auto-scroll
+				</label>
 			</div>
 
 			{!collapsed && (
 				<div className="grid gap-3 grid-cols-1 lg:grid-cols-2 xl:grid-cols-3">
 					{activity.map((entry) => (
-						<AgentPane key={`${entry.taskId}-${entry.status}`} activity={entry} now={now} />
+						<AgentPane
+							key={`${entry.taskId}-${entry.status}`}
+							activity={entry}
+							now={now}
+							autoScroll={autoScroll}
+							onScrolledAway={() => changeAutoScroll(false)}
+						/>
 					))}
 				</div>
 			)}
