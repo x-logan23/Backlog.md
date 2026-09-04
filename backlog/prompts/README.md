@@ -10,10 +10,21 @@ Drop-in templates for running a coder ↔ reviewer ↔ human-review loop on top 
 | `review.md` | Task → `In Review` | Audits the diff against acceptance criteria + DoD, writes structured findings into the task, moves to either `In Progress` (rework) or `Human Review` (approved). |
 | `ready.md` | Task → `Human Review` | Optional notifier. Prints a one-screen summary into the log file. Extend it if you want Slack/email notifications. |
 | `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. Also strips `ANTHROPIC_API_KEY` (forces subscription auth), scopes MCP servers per role, records token usage, and creates the MR on Human Review. |
-| `dispatch.sh` | All of the above (POSIX) | Same core loop, for `sh` / `bash`. |
+| `dispatch.sh` | All of the above (POSIX) | Same core loop and the same three guards, for `sh` / `bash`. Uses `set -C` (noclobber) for the atomic claims the Windows version gets from `File::Open CreateNew`. |
 | `token-report.ps1` | After a coder/reviewer session ends (Windows) | Reads the finished session's token usage out-of-band from its transcript; appends to `logs/tokens.csv` and a per-task line. Zero extra agent tokens. |
+| `watchdog.ps1` | On a timer (Windows) | Nothing else notices when a dispatched agent *process* dies — a provider limit, a crashed MCP subprocess, a machine hiccup — and the task then sits in `In Progress` forever with nothing behind it. Run it from Task Scheduler every ~10 min: it finds those and re-fires the dispatcher. Stateless apart from per-task retry markers. |
 | `create-mr.ps1` | Task → `Human Review` (Windows, GitLab) | Deterministic, idempotent GitLab MR creation. Needs `GITLAB_PROJECT_ID` (skips cleanly when unset, e.g. GitHub) and a token via `GITLAB_TOKEN` / `.mcp.json` / codex config. |
 | `logs/` | (created on first run) | Per-invocation logs (`<timestamp>-<task_id>-<status>.log` plus `.err` for stderr). Inspect these when a hook misbehaves. |
+
+## The three guards
+
+Both dispatchers share these, and each exists because of a specific failure:
+
+- **Dedup lock** (90 s, keyed on `(taskId, status)`) — the hook can fire more than once for one event when the in-process dispatch and the file watcher race. The key deliberately carries **no timestamp**: an earlier version embedded the current second, so two dispatches seconds apart hashed differently, both launched, and two agents attached to one worktree and wrote two parallel implementations of the same feature.
+- **Ping-pong loop guard** (`.hop-NNN` claims, max 6) — the dedup lock does nothing about a task bouncing coder → reviewer → coder forever, each hop legitimate. One task did exactly that and burned two 5-hour provider windows before anyone noticed. Hops are claimed atomically because a read-increment-write counter loses updates under a hook storm (17 fires for one status change has been observed). A watchdog restart (`OLD_STATUS == NEW_STATUS`) deliberately does **not** consume a hop — this counts disagreement, not crashes.
+- **Log retention** (14 days) — nothing used to prune `logs/`, and one deployment reached 48,967 files / 727 MB after a retry storm wrote 29,720 files in a day.
+
+Reset a fenced task with `rm backlog/prompts/logs/<TASK-ID>.hop-*` (or the PowerShell equivalent) once you've re-scoped, reassigned, or split it.
 
 ## Prerequisites
 
@@ -65,9 +76,11 @@ implementation branch. This happens two ways, and both are optional:
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `GITLAB_PROJECT_ID` | `create-mr.ps1` | Numeric project id. **If unset, MR creation is skipped entirely** (the reviewer agent's own step still runs). |
+| `GITLAB_PROJECT_ID` | `watchdog.ps1` | On a timer (Windows) | Nothing else notices when a dispatched agent *process* dies — a provider limit, a crashed MCP subprocess, a machine hiccup — and the task then sits in `In Progress` forever with nothing behind it. Run it from Task Scheduler every ~10 min: it finds those and re-fires the dispatcher. Stateless apart from per-task retry markers. |
+| `create-mr.ps1` | Numeric project id. **If unset, MR creation is skipped entirely** (the reviewer agent's own step still runs). |
 | `GITLAB_TOKEN` | `create-mr.ps1`, `mcp-reviewer.json` | API token. Falls back to `.mcp.json` → `~/.codex/config.toml` if the env var is absent. |
-| `GITLAB_TARGET_BRANCH` | `create-mr.ps1` | Target branch for the MR. Defaults to `main`. |
+| `GITLAB_TARGET_BRANCH` | `watchdog.ps1` | On a timer (Windows) | Nothing else notices when a dispatched agent *process* dies — a provider limit, a crashed MCP subprocess, a machine hiccup — and the task then sits in `In Progress` forever with nothing behind it. Run it from Task Scheduler every ~10 min: it finds those and re-fires the dispatcher. Stateless apart from per-task retry markers. |
+| `create-mr.ps1` | Target branch for the MR. Defaults to `main`. |
 
 The `.claude/mcp-reviewer.json` scaffolded by `backlog init` references the token as
 `${GITLAB_TOKEN}` — set the env var, don't hardcode the secret into the committed file.

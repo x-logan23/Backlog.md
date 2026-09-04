@@ -20,6 +20,7 @@ import reviewTestMd from "../../backlog/prompts/review.test.md" with { type: "te
 import readyTestMd from "../../backlog/prompts/ready.test.md" with { type: "text" };
 import tokenReportPs1 from "../../backlog/prompts/token-report.ps1" with { type: "text" };
 import createMrPs1 from "../../backlog/prompts/create-mr.ps1" with { type: "text" };
+import watchdogPs1 from "../../backlog/prompts/watchdog.ps1" with { type: "text" };
 // The MCP configs resolve as parsed JSON (tsc's built-in JSON module typing);
 // re-serialize them when scaffolding. The ${GITLAB_TOKEN} placeholder is a plain
 // string value and round-trips through JSON faithfully.
@@ -77,6 +78,7 @@ export function buildAgentLoopFiles(backlogDir: string): ScaffoldFile[] {
 		{ path: `${p}/ready.test.md`, content: readyTestMd },
 		{ path: `${p}/token-report.ps1`, content: tokenReportPs1 },
 		{ path: `${p}/create-mr.ps1`, content: createMrPs1 },
+		{ path: `${p}/watchdog.ps1`, content: watchdogPs1 },
 		{ path: ".claude/mcp-coder.json", content: `${JSON.stringify(mcpCoderJson, null, 2)}\n` },
 		{ path: ".claude/mcp-reviewer.json", content: `${JSON.stringify(mcpReviewerJson, null, 2)}\n` },
 	];

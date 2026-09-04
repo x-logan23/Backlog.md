@@ -59,6 +59,100 @@ if [ "${BACKLOG_DISPATCH_DRY_RUN:-}" = "1" ]; then
     exit 0
 fi
 
+# ── Atomic file claim ─────────────────────────────────────────────────────────
+# The Windows dispatcher gets this from File::Open with CreateNew. The POSIX
+# equivalent is `set -C` (noclobber), under which `> file` fails if the file
+# already exists — the check and the create happen in one syscall (O_EXCL), so
+# exactly one racing process can ever win. A plain `[ -f ] && ...` test would be
+# a TOCTOU race and defeat the entire point of these guards.
+claim_file() {
+    if (set -C; : > "$1") 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# ── Deduplication guard ───────────────────────────────────────────────────────
+# The onStatusChange hook can fire more than once for the same event when the
+# in-process dispatch and the file-watcher dispatch race.
+#
+# The key is (taskId, status) ONLY — deliberately no timestamp. An earlier
+# Windows version embedded the current second, so two dispatches a few seconds
+# apart hashed to different keys and both launched, attaching two agents to one
+# worktree and producing two parallel implementations of the same feature.
+# Staleness is decided by the lock file's AGE instead.
+dedupe_ttl_seconds=90
+dedupe_lock="$log_dir/$safe_task_id-$safe_status.dedup"
+
+# Clear a lock older than the TTL so a legitimate later re-dispatch (rework, a
+# relaunch of a stranded session) is never blocked forever. Failure to clear one
+# must never be fatal, hence the redirected errors throughout.
+if [ -f "$dedupe_lock" ]; then
+    lock_mtime="$(date -r "$dedupe_lock" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"
+    if [ "$lock_mtime" -gt 0 ] && [ $((now_epoch - lock_mtime)) -gt "$dedupe_ttl_seconds" ]; then
+        rm -f "$dedupe_lock" 2>/dev/null || true
+    fi
+fi
+
+if ! claim_file "$dedupe_lock"; then
+    echo "dispatch.sh: duplicate suppressed for ${TASK_ID:-?} -> ${NEW_STATUS:-?} (within ${dedupe_ttl_seconds}s dedup window)"
+    exit 0
+fi
+
+# ── Ping-pong loop guard ──────────────────────────────────────────────────────
+# The dedup lock only stops SIMULTANEOUS dispatches. It does nothing about a task
+# bouncing coder -> In Review -> reviewer -> In Progress -> coder forever, each
+# hop a legitimate, well-spaced dispatch. One task did exactly that and burned
+# two 5-hour provider usage windows before a human noticed — neither agent
+# misbehaving, nothing counting.
+#
+# Each dispatch CLAIMS a hop number by atomically creating "<task>.hop-NNN"; the
+# claimed number IS the count. A read-increment-write counter would be a
+# lost-update race, and this hook has been observed firing 17 times for a single
+# status change when several Backlog.md processes each ran it.
+max_round_trips=6
+# A crash-recovery restart is NOT a round trip: watchdog.ps1 re-fires a dead
+# agent with OLD_STATUS = NEW_STATUS, a signature no real transition produces.
+# This guard exists to stop coder/reviewer DISAGREEMENT, so it counts
+# disagreement, not crashes.
+if [ "${OLD_STATUS:-}" != "${NEW_STATUS:-}" ] &&
+   { [ "${NEW_STATUS:-}" = "In Progress" ] || [ "${NEW_STATUS:-}" = "In Review" ]; }; then
+    # Age out a finished/abandoned cycle so a task is never blocked forever.
+    find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" -mmin +1440 -delete 2>/dev/null || true
+
+    trips=0
+    n=1
+    while [ "$n" -le $((max_round_trips + 1)) ]; do
+        hop_file="$(printf '%s/%s.hop-%03d' "$log_dir" "$safe_task_id" "$n")"
+        if claim_file "$hop_file"; then
+            trips="$n"
+            break
+        fi
+        n=$((n + 1))
+    done
+
+    if [ "$trips" -eq 0 ] || [ "$trips" -gt "$max_round_trips" ]; then
+        echo "dispatch.sh: LOOP GUARD - ${TASK_ID:-?} has exhausted $max_round_trips coder/reviewer hops. NOT dispatching."
+        echo "dispatch.sh: a human must decide (re-scope, reassign, or split). Reset with: rm '$log_dir/$safe_task_id.hop-'*"
+        exit 0
+    fi
+    if [ "$trips" -eq "$max_round_trips" ]; then
+        echo "dispatch.sh: WARNING - ${TASK_ID:-?} is on hop $trips of $max_round_trips; the next one is blocked."
+    fi
+fi
+
+# Prune dedup files well past the TTL so they don't accumulate.
+find "$log_dir" -maxdepth 1 -name '*.dedup' -mmin +6 -delete 2>/dev/null || true
+
+# ── Dispatch-log retention ────────────────────────────────────────────────────
+# Nothing used to prune these, and one deployment's log directory reached 48,967
+# files / 727 MB — a retry storm wrote 29,720 files in a single day. Keep 14
+# days: far longer than any post-mortem needs, still bounded. Never fatal.
+for ext in log err pid prompt rework resume; do
+    find "$log_dir" -maxdepth 1 -type f -name "*.$ext" -mtime +14 -delete 2>/dev/null || true
+done
+
 # ── Agent resolution ─────────────────────────────────────────────────────────
 #
 # Priority: per-task frontmatter field > BACKLOG_DEFAULT_AGENT env var > "claude"
