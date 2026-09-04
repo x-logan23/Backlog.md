@@ -123,8 +123,14 @@ export default function BoardPage({
 	].map((label) => label.trim()).filter((label) => label.length > 0);
 	const filterPriority = searchParams.get('priority') ?? '';
 
+	// Full-bleed rather than Tailwind's `container`, which caps at the current
+	// breakpoint's max-width (96rem at 2xl) and centres — so on a wide monitor the
+	// board sat in the middle with dead margins either side while its columns were
+	// squeezed. The board already divides whatever width it is given (flex-1
+	// columns with a 16rem floor, scrolling horizontally only once even that no
+	// longer fits), so the page just has to stop capping it.
 	return (
-		<div className="container mx-auto px-4 py-8 transition-colors duration-200">
+		<div className="w-full px-4 sm:px-6 py-8 transition-colors duration-200">
 			<LiveAgentPanel />
 			<Board
 				onEditTask={handleEditTask}
