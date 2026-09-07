@@ -387,7 +387,7 @@ Get-ChildItem $logDir -Filter '*.dedup' -ErrorAction SilentlyContinue |
 
 # ── Dispatch-log retention ────────────────────────────────────────────────────
 # Nothing used to prune the dispatch logs themselves (.log/.err/.pid/.prompt/
-# .rework/.resume), so they accumulated indefinitely. One deployment's log
+# .rework/.resume/.hop-NNN), so they accumulated indefinitely. One deployment's log
 # directory reached 48,967 files / 727 MB and had to be moved out by hand: a
 # retry storm on a single task wrote 29,720 files in one day (~3,000/hour) while
 # the normal rate had been 50-300/day for months. A directory that large is slow
@@ -397,13 +397,21 @@ Get-ChildItem $logDir -Filter '*.dedup' -ErrorAction SilentlyContinue |
 # few thousand files at normal rates. Capped per run so a huge backlog is chipped
 # away rather than stalling a dispatch, and wrapped so a pruning failure can
 # never block one.
+# The hop claims need a name match, not an extension one: PowerShell reads
+# ".hop-004" as the extension, so there is no fixed suffix to list. They are only
+# consulted within 24h -- the loop guard ages out anything older before it claims
+# -- so pruning them at 14 days cannot change a dispatch decision. Without this
+# they were the one thing here that nothing ever removed: a task that stops
+# dispatching keeps its claims forever, and one live deployment had 234 of them
+# going back three weeks.
 $logRetentionDays = 14
 $maxPrunePerRun = 500
 try {
     Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.LastWriteTime -lt (Get-Date).AddDays(-$logRetentionDays) -and
-            $_.Extension -in @('.log', '.err', '.pid', '.prompt', '.rework', '.resume')
+            ($_.Extension -in @('.log', '.err', '.pid', '.prompt', '.rework', '.resume') -or
+             $_.Name -like '*.hop-*')
         } |
         Select-Object -First $maxPrunePerRun |
         Remove-Item -Force -ErrorAction SilentlyContinue

@@ -266,6 +266,11 @@ find "$log_dir" -maxdepth 1 -name '*.dedup' -mmin +6 -delete 2>/dev/null || true
 for ext in log err pid prompt rework resume; do
     find "$log_dir" -maxdepth 1 -type f -name "*.$ext" -mtime +14 -delete 2>/dev/null || true
 done
+# Hop claims have no fixed suffix (.hop-001, .hop-002, ...) so they need their own
+# glob. Safe at 14 days: the loop guard ages out anything over 24h before it
+# claims, so a fortnight-old claim can no longer affect a dispatch. Without this
+# nothing ever removed them and a task that stops dispatching keeps them forever.
+find "$log_dir" -maxdepth 1 -type f -name '*.hop-*' -mtime +14 -delete 2>/dev/null || true
 
 # ── Agent resolution ─────────────────────────────────────────────────────────
 #
