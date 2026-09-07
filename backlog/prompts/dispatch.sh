@@ -85,6 +85,39 @@ if [ "${NEW_STATUS:-}" = "Testing" ]; then
     exit 0
 fi
 
+# ── Per-task log paths ───────────────────────────────────────────────────
+# Set here rather than with the rest of the log setup further down, because the
+# Blocked branch below needs them and runs before any of that.
+log_dir="$prompts_dir/logs"
+mkdir -p "$log_dir"
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+safe_task_id="$(sanitize "${TASK_ID:-unknown}")"
+
+# ── Blocked ──────────────────────────────────────────────────────────────────
+# Where the loop guard parks a task it has fenced, and where a human parks one
+# that cannot proceed for any other reason (infra down, waiting on another task,
+# a decision nobody has made yet). Definition: NO FURTHER AUTOMATED PROGRESS IS
+# POSSIBLE UNTIL A PERSON ACTS.
+#
+# That deliberately excludes transient failures -- provider session limits, a
+# crashed MCP subprocess, a machine hiccup. Those resolve themselves or are
+# resumed by the watchdog, which finds them by the status they were dispatched
+# for; moving them here would hide them from the one thing that recovers them.
+#
+# Nothing dispatches on Blocked: the case below falls through to `exit 0`.
+#
+# LEAVING it is the interesting half. A human dragging a task out of Blocked is
+# the only signal that someone has looked at a fenced task and vouched for it, so
+# that is where the hop claims get cleared. Without this the task re-fences on
+# its first dispatch and the column becomes one tasks enter and never leave.
+if [ "${OLD_STATUS:-}" = "Blocked" ] && [ "${NEW_STATUS:-}" != "Blocked" ]; then
+    cleared="$(find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${cleared:-0}" -gt 0 ]; then
+        find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" -delete 2>/dev/null || true
+        echo "dispatch.sh: unblocked ${TASK_ID:-?} - cleared $cleared hop claim(s); the loop guard starts over."
+    fi
+fi
+
 case "${NEW_STATUS:-}" in
     "In Progress")  prompt_file="$prompts_dir/code$suffix" ;;
     "In Review")    prompt_file="$prompts_dir/review$suffix" ;;
@@ -105,11 +138,8 @@ Task: ${TASK_ID:-?} — ${TASK_TITLE:-?}
 Status: ${OLD_STATUS:-?} → ${NEW_STATUS:-?}"
 
 # Per-invocation log file so concurrent hooks don't clobber each other.
-log_dir="$prompts_dir/logs"
-mkdir -p "$log_dir"
+# log_dir, sanitize() and safe_task_id are set above, before the Blocked branch.
 timestamp="$(date +%Y%m%d-%H%M%S-%3N)"
-sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
-safe_task_id="$(sanitize "${TASK_ID:-unknown}")"
 safe_status="$(sanitize "${NEW_STATUS:-unknown}")"
 log_file="$log_dir/$timestamp-$$-$safe_task_id-$safe_status.log"
 prompt_path="$log_file.prompt"
@@ -182,7 +212,43 @@ if [ "${OLD_STATUS:-}" != "${NEW_STATUS:-}" ] &&
 
     if [ "$trips" -eq 0 ] || [ "$trips" -gt "$max_round_trips" ]; then
         echo "dispatch.sh: LOOP GUARD - ${TASK_ID:-?} has exhausted $max_round_trips coder/reviewer hops. NOT dispatching."
-        echo "dispatch.sh: a human must decide (re-scope, reassign, or split). Reset with: rm '$log_dir/$safe_task_id.hop-'*"
+
+        # Park it in Blocked rather than leaving it where it stopped. Refusing to
+        # dispatch used to be the whole guard, which left the task sitting in
+        # In Progress/In Review looking exactly like a healthy one -- the only
+        # trace was a line in a log nobody reads. Moving it puts it on the board,
+        # in front of the person who has to decide.
+        #
+        # Safe from inside the hook: this status change re-enters dispatch.sh and
+        # Blocked falls through the case above to exit 0. The note goes in first
+        # and without -s, so the reason is on the task before the move lands.
+        #
+        # --append-notes, never --notes: the latter REPLACES the notes section,
+        # deleting the coder's and reviewer's record of the six rounds that are
+        # the whole reason this is being fenced.
+        blocked_note="Loop guard: fenced after $max_round_trips coder/reviewer hops without converging.
+Last transition: ${OLD_STATUS:-?} -> ${NEW_STATUS:-?}. Log: $log_file
+
+The agents were not misbehaving -- they simply kept disagreeing. A human needs to
+re-scope, split, reassign, or accept it. Moving this task out of Blocked clears
+the hop claims and the loop starts over."
+
+        # Run from the project root: the CLI locates the project by walking up
+        # from the working directory, and the hook inherits whatever cwd the
+        # server that fired it happened to have. Subshell so the cd cannot leak.
+        if (cd "$project_root" && backlog task edit "${TASK_ID:-}" --append-notes "$blocked_note" >/dev/null 2>&1); then
+            :
+        else
+            echo "dispatch.sh: could not append the block reason to ${TASK_ID:-?}."
+        fi
+        if (cd "$project_root" && backlog task edit "${TASK_ID:-}" -s Blocked >/dev/null 2>&1); then
+            echo "dispatch.sh: ${TASK_ID:-?} moved to Blocked for a human decision."
+        else
+            # A project whose statuses have no Blocked (or no CLI on PATH) keeps
+            # the old behaviour: fenced in place, nothing dispatched.
+            echo "dispatch.sh: ${TASK_ID:-?} stays in ${NEW_STATUS:-?} - no Blocked status configured, or the CLI is unavailable."
+            echo "dispatch.sh: a human must decide (re-scope, reassign, or split). Reset with: rm '$log_dir/$safe_task_id.hop-'*"
+        fi
         exit 0
     fi
     if [ "$trips" -eq "$max_round_trips" ]; then

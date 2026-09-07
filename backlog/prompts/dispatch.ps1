@@ -9,6 +9,9 @@
 $ErrorActionPreference = 'Stop'
 $scriptDir = $PSScriptRoot
 $promptsDir = $scriptDir
+# Resolved here rather than at first use: the loop guard below needs it to park a
+# fenced task in Blocked, and that runs long before agent dispatch.
+$projectRoot = (Resolve-Path (Join-Path $scriptDir '..\..') ).Path
 
 # ── Force subscription auth for dispatched agents ────────────────────────────
 # If the project it manages also uses the Anthropic API, its ANTHROPIC_API_KEY
@@ -110,6 +113,47 @@ if ($env:NEW_STATUS -eq 'Testing') {
     exit 0
 }
 
+# ── Per-task log paths ───────────────────────────────────────────────────
+# Set here rather than with the rest of the log setup further down, because the
+# Blocked branch below needs both and runs before any of that.
+$logDir = Join-Path $promptsDir 'logs'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$safeTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
+if (-not $safeTaskId) { $safeTaskId = 'unknown' }
+
+# ── Blocked ──────────────────────────────────────────────────────────────────
+# Where the loop guard parks a task it has fenced, and where a human parks one
+# that cannot proceed for any other reason (infra down, waiting on another task,
+# a decision nobody has made yet). Definition: NO FURTHER AUTOMATED PROGRESS IS
+# POSSIBLE UNTIL A PERSON ACTS.
+#
+# That definition deliberately excludes the transient failures -- provider
+# session limits, a crashed MCP subprocess, a machine hiccup. Those resolve
+# themselves or are resumed by watchdog.ps1, which finds them by the status they
+# were dispatched for; moving them here would hide them from the one thing that
+# recovers them, and break the panel's liveness check (it requires a task still
+# be in its dispatch status, the fix for PID reuse). Leave those where they are.
+#
+# Nothing dispatches on Blocked -- the prompt selection below already falls
+# through to `exit 0` for it, so entering the column can never fire an agent.
+#
+# LEAVING it is the interesting half. A human dragging a task out of Blocked is
+# the only signal in the system that someone has looked at a fenced task and
+# vouched for it, so that is where the hop claims get cleared. Without this the
+# task re-fences on its first dispatch and the column becomes a place tasks
+# enter and never leave -- a prettier version of the bug it was added to fix.
+if ($env:OLD_STATUS -eq 'Blocked' -and $env:NEW_STATUS -ne 'Blocked') {
+    try {
+        $cleared = @(Get-ChildItem $logDir -Filter "$safeTaskId.hop-*" -ErrorAction SilentlyContinue)
+        if ($cleared.Count -gt 0) {
+            $cleared | Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host "dispatch.ps1: unblocked $env:TASK_ID - cleared $($cleared.Count) hop claim(s); the loop guard starts over."
+        }
+    } catch {
+        Write-Host "dispatch.ps1: hop-claim reset skipped ($($_.Exception.Message)) - continuing"
+    }
+}
+
 # ── Prompt file selection ────────────────────────────────────────────────────
 if ($env:NEW_STATUS -eq 'In Progress') {
     $promptStem = 'code'
@@ -143,11 +187,8 @@ Status: $env:OLD_STATUS -> $env:NEW_STATUS
 "@
 
 # ── Log file ─────────────────────────────────────────────────────────────────
-$logDir = Join-Path $promptsDir 'logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+# $logDir and $safeTaskId are set above, before the Blocked branch that needs them.
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-$safeTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
-if (-not $safeTaskId) { $safeTaskId = 'unknown' }
 $safeStatus = ($env:NEW_STATUS -replace '[<>:"/\\|?*\s]+', '_')
 if (-not $safeStatus) { $safeStatus = 'unknown' }
 $logFile = Join-Path $logDir "$timestamp-$PID-$safeTaskId-$safeStatus.log"
@@ -269,7 +310,66 @@ if (-not $isCrashRecovery -and ($env:NEW_STATUS -eq 'In Progress' -or $env:NEW_S
 
         if ($trips -eq 0 -or $trips -gt $maxRoundTrips) {
             Write-Host "dispatch.ps1: LOOP GUARD - $env:TASK_ID has exhausted $maxRoundTrips coder/reviewer hops. NOT dispatching."
-            Write-Host "dispatch.ps1: a human must decide (re-scope, reassign, or split). Reset with: Remove-Item '$logDir\$safeTaskId.hop-*'"
+
+            # Park it in Blocked rather than leaving it where it stopped. Refusing
+            # to dispatch used to be the whole guard, which left the task sitting
+            # in In Progress/In Review looking exactly like a healthy one -- the
+            # only trace was a line in a log nobody reads. Moving it puts it on
+            # the board, in front of the person who has to decide.
+            #
+            # Safe to do from inside the hook: this status change re-enters
+            # dispatch.ps1, and Blocked falls through prompt selection to exit 0.
+            # The note goes in FIRST and without -s, so the reason is already on
+            # the task when the move lands and an annotation can never re-trigger
+            # anything on its own.
+            $blockedNote = @"
+Loop guard: fenced after $maxRoundTrips coder/reviewer hops without converging.
+Last transition: $env:OLD_STATUS -> $env:NEW_STATUS. Log: $logFile
+
+The agents were not misbehaving -- they simply kept disagreeing. A human needs to
+re-scope, split, reassign, or accept it. Moving this task out of Blocked clears
+the hop claims and the loop starts over.
+"@
+            # Run from the project root: the CLI locates the project by walking
+            # up from the working directory, and the hook inherits whatever cwd
+            # the server that fired it happened to have.
+            #
+            # $LASTEXITCODE, not try/catch: a native executable returning non-zero
+            # does not raise in PowerShell, so a catch block alone would report
+            # success for a task that never moved -- which is the one outcome that
+            # must not be reported wrongly, since nothing else is watching.
+            $parked = $false
+            $prevEap = $ErrorActionPreference
+            Push-Location $projectRoot
+            try {
+                # PowerShell 5.1 wraps a native command's stderr in an ErrorRecord
+                # and makes it TERMINATING while ErrorActionPreference is Stop --
+                # for an exe that exited 0 and merely warned, too. That would abort
+                # the parking after the move had already succeeded. Judge these two
+                # calls by exit code alone.
+                $ErrorActionPreference = 'Continue'
+                # --append-notes, never --notes: the latter REPLACES the notes
+                # section, which would delete the coder's and reviewer's record of
+                # the six rounds that are the whole reason this is being fenced.
+                & backlog task edit $env:TASK_ID --append-notes $blockedNote 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Host "dispatch.ps1: could not append the block reason to $env:TASK_ID (exit $LASTEXITCODE)." }
+                & backlog task edit $env:TASK_ID -s Blocked 2>&1 | Out-Null
+                $parked = ($LASTEXITCODE -eq 0)
+            } catch {
+                Write-Host "dispatch.ps1: parking $env:TASK_ID in Blocked failed ($($_.Exception.Message))."
+            } finally {
+                $ErrorActionPreference = $prevEap
+                Pop-Location
+            }
+
+            if ($parked) {
+                Write-Host "dispatch.ps1: $env:TASK_ID moved to Blocked for a human decision."
+            } else {
+                # A project whose statuses have no Blocked (or no CLI on PATH)
+                # keeps the old behaviour: fenced in place, nothing dispatched.
+                Write-Host "dispatch.ps1: $env:TASK_ID stays in $env:NEW_STATUS - no Blocked status configured, or the CLI is unavailable."
+                Write-Host "dispatch.ps1: a human must decide (re-scope, reassign, or split). Reset with: Remove-Item '$logDir\$safeTaskId.hop-*'"
+            }
             exit 0
         }
         if ($trips -eq $maxRoundTrips) {
@@ -315,7 +415,6 @@ try {
 # Tasks without `agent:` in frontmatter are human tasks -- skip dispatch.
 # Exception: Human Review always fires the notifier (ready.md).
 
-$projectRoot = (Resolve-Path (Join-Path $scriptDir '..\..') ).Path
 $tasksDir = Join-Path $projectRoot 'backlog\tasks'
 
 # ── Alias → binary resolution ─────────────────────────────────────────────────

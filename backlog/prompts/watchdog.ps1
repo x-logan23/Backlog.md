@@ -65,6 +65,17 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out
 # resting state with no process to lose.
 $watchedStatuses = @('In Progress', 'In Review')
 
+# Blocked is excluded as a RULE, not merely by being absent from the list above.
+# It is where dispatch.ps1's loop guard parks a task it has fenced, and where a
+# human parks one waiting on something outside the loop. Both mean "a person must
+# act"; re-firing the dispatcher would restart exactly the loop the guard just
+# stopped, and would do it on a timer, unattended, forever.
+#
+# Stated separately because the two lists are not the same thing and drift apart:
+# $watchedStatuses is "has a process that can die", this is "must never be
+# auto-resumed". Widening the first must not silently widen the second.
+$neverResumeStatuses = @('Blocked')
+
 $acted = 0
 $checked = 0
 # Marker basenames for tasks that are still in a watched status this run.
@@ -81,6 +92,7 @@ foreach ($taskFile in (Get-ChildItem $tasksDir -Filter '*.md' -File -ErrorAction
 
     $taskId = $idMatch.Groups[1].Value.Trim()
     $status = $statusMatch.Groups[1].Value.Trim()
+    if ($neverResumeStatuses -contains $status) { continue }
     if ($watchedStatuses -notcontains $status) { continue }
 
     # Tasks without an `agent:` field are human work -- nothing to restart.

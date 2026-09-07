@@ -211,6 +211,68 @@ The clamp is deliberately in the view. `hop` stays the raw claimed count over th
 API, because the sentinel is real bookkeeping and the +1 is the dispatcher's
 contract to describe, not the server's to launder.
 
+### 8. `Blocked`, and what happens when the fence fires
+
+The guard stopped the loop but left the task where it stopped. A fenced task sat
+in `In Progress` or `In Review` looking exactly like a healthy one, and the only
+trace was a line in a log nobody reads — so it stopped moving and nobody found
+out until someone wondered why. `hop 6/6` in the panel was the only tell, and the
+panel is not where you look when you are not already suspicious.
+
+`Blocked` is now a real column. The fence appends the reason to the task's notes
+and moves it there. One definition covers both it and the manual use (infra down,
+waiting on another task, a decision nobody has made): **no further automated
+progress is possible until a person acts.**
+
+**Leaving `Blocked` clears the hop claims, and that is the feature.** The column
+on its own would have been cosmetic — the same stuck task on a better shelf.
+Dragging a task out is the only signal in the system that a person has looked at
+a fenced task and vouched for it, so that is where the counter resets. Without
+it the task re-fences on its first dispatch and `Blocked` is a column tasks enter
+and never leave. It also retires the hand-run `rm ... .hop-*` that §7 above had
+just put in a tooltip.
+
+**What deliberately does NOT go there: the transient failures.** Provider session
+limits, a crashed MCP subprocess, a machine hiccup. Both panes in the screenshot
+that prompted this were sitting on `You've hit your session limit — resets
+1:20am`, which is not a blocked task but a paused one, and moving those would
+have made things worse twice over: `watchdog.ps1` finds resumable agents *by the
+status they were dispatched for*, and so does `isLikelyRunning()` (§2). Parking
+them in `Blocked` hides them from the one thing that recovers them and drops
+their pane from the panel — converting a self-healing case into a manual one to
+make it look tidier.
+
+The watchdog skips `Blocked` by an explicit `$neverResumeStatuses` rule rather
+than by being absent from `$watchedStatuses`. The two lists answer different
+questions — "has a process that can die" versus "must never be auto-resumed" —
+and widening the first must not silently widen the second.
+
+**Two things nearly went wrong, both worth remembering:**
+
+- **`Blocked` must not be last in `statuses`.** `getTerminalStatus()` is defined
+  as the final entry, and that is what `getTerminalStatusTasksByAge()` archives by
+  age and what the board's cleanup affordance hangs off. Appending it after `Done`
+  — the obvious placement, since it is an exit from the flow — points cleanup at
+  blocked tasks and stops it ever archiving finished ones. It sits second-to-last;
+  `src/test/agent-loop-statuses.test.ts` pins that, because nothing else would
+  catch a reorder.
+- **`task edit --notes` REPLACES the notes section.** The reason a task is being
+  fenced is the six rounds recorded in its notes, so writing the block reason with
+  `--notes` would delete exactly the evidence the human needs. `--append-notes`.
+
+Both dispatchers also learned that `$logDir`/`$safeTaskId` (and the sh
+equivalents) are needed *before* prompt selection now, since the unblock reset
+runs there; they were previously set below it.
+
+Unlike `Testing` (§5), this ships in the default statuses. The reasoning inverts:
+`Testing` strands every task entering it without a runner, whereas `Blocked` needs
+nothing behind it — nothing dispatches on it by design.
+
+**Not verified against a live loop.** The paths are exercised only by reading:
+no task has actually been fenced since the change. The first real fence is worth
+watching, particularly that the in-hook `backlog task edit -s Blocked` re-enters
+the dispatcher and exits cleanly rather than doing anything surprising.
+
 ---
 
 ## Environment facts that cost time
