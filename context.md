@@ -189,6 +189,28 @@ Two traps worth remembering, both already hit:
   capped at 40; once a busy pane fills, length stops changing while content keeps
   moving, so it would stop following exactly the agent worth watching.
 
+### 7. Fenced tasks read as `hop 7/6`
+
+**The panel has now been reviewed in a browser by a person** (2026-09-07, on the
+kiero-app board) and the layout is confirmed. That review found one thing.
+
+`dispatch.ps1` claims one hop file *beyond* the cap as a sentinel and then
+refuses — the loop runs to `$maxRoundTrips + 1`, and `$trips -gt $maxRoundTrips`
+exits without dispatching. So `.hop-007` records **that the fence fired**, not
+that a seventh hop ran. `hopCount()` reported 7 faithfully and the pane rendered
+`hop {hop}/{maxHops}` — `hop 7/6` on screen, for the one state that cannot
+proceed without a human.
+
+Worse, it was styled identically to `hop 6/6`, which is a different state:
+6/6 means *the next hop is blocked*, 7 means *a dispatch has already been
+refused*. `LiveAgentPanel.tsx` now clamps the number, adds `· fenced` in red, and
+puts the reset in the tooltip — nothing else told you that a fenced task stays
+fenced until `backlog/prompts/logs/<id>.hop-*` is deleted by hand.
+
+The clamp is deliberately in the view. `hop` stays the raw claimed count over the
+API, because the sentinel is real bookkeeping and the +1 is the dispatcher's
+contract to describe, not the server's to launder.
+
 ---
 
 ## Environment facts that cost time
@@ -220,17 +242,13 @@ Two traps worth remembering, both already hit:
 
 **Known gaps, none blocking:**
 
-1. **The panel has never been reviewed in a browser by a person.** Its data is
-   verified end-to-end, but the playwright MCP failed to connect for this whole
-   session, so every check was via the API and the served bundle. Layout is
-   unproven beyond two user screenshots.
-2. **`dispatch.sh` has no stranded-retry path.** Safe (it launches fresh) but a
+1. **`dispatch.sh` has no stranded-retry path.** Safe (it launches fresh) but a
    real feature gap versus `dispatch.ps1`. Left rather than written blind, since a
    resume path cannot be exercised without live agents.
-3. **The 416-failure suite.** Its own body of work: triage by root cause first —
+2. **The 416-failure suite.** Its own body of work: triage by root cause first —
    a large share look like POSIX-shaped fixtures (`/bin/sh`, AF_UNIX binds), path
    separators and 5s subprocess timeouts, not 416 independent bugs.
-4. **`package.json` is still `1.45.1`** (upstream's). A bump would let
+3. **`package.json` is still `1.45.1`** (upstream's). A bump would let
    `backlog --version` distinguish the fork — carried over from
    `FORK_CONTEXT.md`'s list and still true.
 

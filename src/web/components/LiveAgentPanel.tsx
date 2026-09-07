@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { safeSegment } from '../../core/agent-activity.ts';
 import { type AgentActivity, type AgentEvent, useAgentActivity } from '../hooks/useAgentActivity';
 
 /**
@@ -133,7 +134,19 @@ const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activit
 	// A live pid with a long-silent feed is the stranded-session signature — say so
 	// rather than collapsing it into a plain "idle".
 	const stranded = !running && pidAlive && quiet;
-	const hopWarning = hop >= maxHops - 1;
+	// The dispatcher claims one hop file beyond the cap as a sentinel and then
+	// refuses to dispatch (dispatch.ps1 loops to `$maxRoundTrips + 1`), so a raw
+	// count above the cap means "the fence fired", not "an extra hop ran". Showing
+	// that verbatim reads as `hop 7/6` — arithmetic nonsense on the one state that
+	// actually needs a human. Clamp the number and name the state instead.
+	const fenced = hop > maxHops;
+	const hopWarning = !fenced && hop >= maxHops - 1;
+	// Nothing else tells you a fenced task stays fenced until the claims are
+	// cleared by hand, so the tooltip carries the reset. The dispatcher names its
+	// claims after the same segment-safe task id.
+	const hopTitle = fenced
+		? `dispatcher loop guard: exhausted — no further dispatch until the claims are cleared (delete backlog/prompts/logs/${safeSegment(taskId)}.hop-*)`
+		: 'dispatcher loop guard';
 
 	return (
 		<div className="flex flex-col rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden">
@@ -173,8 +186,18 @@ const AgentPane: React.FC<{ activity: AgentActivity; now: number }> = ({ activit
 						{tokensPartial && <span className="text-gray-400"> (tail only)</span>}
 					</span>
 				)}
-				<span className={hopWarning ? 'text-amber-600 dark:text-amber-400 font-medium' : ''} title="dispatcher loop guard">
-					hop {hop}/{maxHops}
+				<span
+					className={
+						fenced
+							? 'text-red-600 dark:text-red-400 font-medium'
+							: hopWarning
+								? 'text-amber-600 dark:text-amber-400 font-medium'
+								: ''
+					}
+					title={hopTitle}
+				>
+					hop {Math.min(hop, maxHops)}/{maxHops}
+					{fenced && ' · fenced'}
 				</span>
 				<span className="text-gray-400 dark:text-gray-600">{SOURCE_LABEL[source]}</span>
 
