@@ -9,18 +9,150 @@
 $ErrorActionPreference = 'Stop'
 $scriptDir = $PSScriptRoot
 $promptsDir = $scriptDir
+# Resolved here rather than at first use: the loop guard below needs it to park a
+# fenced task in Blocked, and that runs long before agent dispatch.
+$projectRoot = (Resolve-Path (Join-Path $scriptDir '..\..') ).Path
 
 # ── Force subscription auth for dispatched agents ────────────────────────────
-# The repo-root .env carries ANTHROPIC_API_KEY for the app (OCR / WhatsApp LLM),
-# and docker-compose / the watcher shell leak it into this process's environment.
-# The Claude CLI prefers an API key over the subscription OAuth token whenever the
-# var is present, so every dispatched coder/reviewer was silently billing to the
-# API account (cost spike + "Credit balance is too low" when it ran dry) instead
-# of the Pro subscription. The dispatcher never calls the Anthropic API itself,
-# and Codex/opencode don't use this var, so stripping it here forces every
-# dispatched Claude to fall back to the subscription token. The app's own key is
-# untouched — it's injected straight into the containers by docker-compose.
+# If the project it manages also uses the Anthropic API, its ANTHROPIC_API_KEY
+# tends to reach this process's environment (a repo-root .env, a compose file, or
+# the shell that started the watcher). The Claude CLI prefers an API key over the
+# subscription OAuth token whenever that var is present, so every dispatched
+# coder/reviewer silently bills the API account instead of the subscription — a
+# cost spike, then "Credit balance is too low" once it runs dry.
+#
+# The dispatcher never calls the Anthropic API itself and Codex/opencode ignore
+# this var, so stripping it here is free and forces every dispatched Claude onto
+# the subscription token. The application's own key is untouched: this only
+# affects the environment of the agents launched below.
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+
+# ── Testing status: hand off to the project's own test runner ─────────────────
+# OPT-IN. This status is not in the default pipeline, because a `Testing` column
+# with no runner behind it strands every task that enters it. To use it:
+#
+#   1. add "Testing" to `statuses:` in backlog/config.yml, between In Progress
+#      and In Review;
+#   2. drop a `run-full-suite.ps1` next to this file;
+#   3. tell your coder prompt to move finished work to `Testing` rather than
+#      straight to `In Review`.
+#
+# The runner is necessarily project-specific — it knows how your suite boots —
+# so none ships here. Its CONTRACT is what matters:
+#
+#   * invoked as: run-full-suite.ps1 -TaskId <id> -ProjectRoot <path>
+#   * runs detached and may take as long as it needs; nothing waits on it
+#   * reports back through the backlog CLI itself:
+#       all green -> status In Review,  notes: a pass summary
+#       any red   -> status In Progress, notes: which leg failed + a log excerpt
+#   * appends notes WITHOUT -s/--status when it only wants to annotate, so a note
+#     can never re-trigger this hook
+#
+# A red result landing the task back in In Progress is picked up below as
+# $isTestFailureRetry, which resumes the coder's session rather than starting a
+# fresh one that has never seen the failure.
+#
+# Isolated from the agent-dispatch path on purpose: no prompt file, no agent
+# binary, no session to resume. This branch only dedupes, launches, and exits.
+if ($env:NEW_STATUS -eq 'Testing') {
+    $testLogDir = Join-Path $PSScriptRoot 'logs'
+    if (-not (Test-Path $testLogDir)) { New-Item -ItemType Directory -Path $testLogDir | Out-Null }
+    $safeTestTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
+    if (-not $safeTestTaskId) { $safeTestTaskId = 'unknown' }
+
+    $testRunnerScript = Join-Path $PSScriptRoot 'run-full-suite.ps1'
+    if (-not (Test-Path $testRunnerScript)) {
+        # Say so loudly. Silence here looks exactly like a passing gate, and the
+        # task would sit in Testing forever with nobody able to tell why.
+        Write-Warning "dispatch.ps1: task $env:TASK_ID entered 'Testing' but no run-full-suite.ps1 exists next to this script."
+        Write-Warning "dispatch.ps1: it will sit there until a human moves it. Add a runner, or drop 'Testing' from statuses in backlog/config.yml."
+        exit 0
+    }
+
+    # Same dedup shape as the agent path: key on (taskId, status) only, decide
+    # staleness by file age, and claim atomically.
+    $testDedupeTtlSeconds = 90
+    $testDedupeLock = Join-Path $testLogDir "$safeTestTaskId-Testing.dedup"
+    try {
+        $testLockItem = Get-Item $testDedupeLock -ErrorAction SilentlyContinue
+        if ($null -ne $testLockItem) {
+            $lockAge = (Get-Date) - $testLockItem.LastWriteTime
+            if ($lockAge.TotalSeconds -gt $testDedupeTtlSeconds) {
+                Remove-Item $testDedupeLock -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Host "dispatch.ps1: stale Testing-lock check skipped ($($_.Exception.Message))"
+    }
+    try {
+        $s = [System.IO.File]::Open($testDedupeLock,
+                 [System.IO.FileMode]::CreateNew,
+                 [System.IO.FileAccess]::ReadWrite,
+                 [System.IO.FileShare]::None)
+        $s.Close()
+    } catch {
+        Write-Host "dispatch.ps1: duplicate Testing dispatch suppressed for $env:TASK_ID (within ${testDedupeTtlSeconds}s dedup window)"
+        exit 0
+    }
+
+    $testProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    $testStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $testLogFile = Join-Path $testLogDir "$testStamp-$PID-$safeTestTaskId-Testing.log"
+
+    Write-Host "dispatch.ps1: task=$env:TASK_ID status=Testing -- launching run-full-suite.ps1 detached"
+    Start-Process `
+        -FilePath 'powershell.exe' `
+        -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testRunnerScript,
+            '-TaskId', $env:TASK_ID, '-ProjectRoot', $testProjectRoot
+        ) `
+        -RedirectStandardOutput $testLogFile `
+        -RedirectStandardError "$testLogFile.err" `
+        -WindowStyle Hidden `
+        -WorkingDirectory $testProjectRoot
+    exit 0
+}
+
+# ── Per-task log paths ───────────────────────────────────────────────────
+# Set here rather than with the rest of the log setup further down, because the
+# Blocked branch below needs both and runs before any of that.
+$logDir = Join-Path $promptsDir 'logs'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$safeTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
+if (-not $safeTaskId) { $safeTaskId = 'unknown' }
+
+# ── Blocked ──────────────────────────────────────────────────────────────────
+# Where the loop guard parks a task it has fenced, and where a human parks one
+# that cannot proceed for any other reason (infra down, waiting on another task,
+# a decision nobody has made yet). Definition: NO FURTHER AUTOMATED PROGRESS IS
+# POSSIBLE UNTIL A PERSON ACTS.
+#
+# That definition deliberately excludes the transient failures -- provider
+# session limits, a crashed MCP subprocess, a machine hiccup. Those resolve
+# themselves or are resumed by watchdog.ps1, which finds them by the status they
+# were dispatched for; moving them here would hide them from the one thing that
+# recovers them, and break the panel's liveness check (it requires a task still
+# be in its dispatch status, the fix for PID reuse). Leave those where they are.
+#
+# Nothing dispatches on Blocked -- the prompt selection below already falls
+# through to `exit 0` for it, so entering the column can never fire an agent.
+#
+# LEAVING it is the interesting half. A human dragging a task out of Blocked is
+# the only signal in the system that someone has looked at a fenced task and
+# vouched for it, so that is where the hop claims get cleared. Without this the
+# task re-fences on its first dispatch and the column becomes a place tasks
+# enter and never leave -- a prettier version of the bug it was added to fix.
+if ($env:OLD_STATUS -eq 'Blocked' -and $env:NEW_STATUS -ne 'Blocked') {
+    try {
+        $cleared = @(Get-ChildItem $logDir -Filter "$safeTaskId.hop-*" -ErrorAction SilentlyContinue)
+        if ($cleared.Count -gt 0) {
+            $cleared | Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host "dispatch.ps1: unblocked $env:TASK_ID - cleared $($cleared.Count) hop claim(s); the loop guard starts over."
+        }
+    } catch {
+        Write-Host "dispatch.ps1: hop-claim reset skipped ($($_.Exception.Message)) - continuing"
+    }
+}
 
 # ── Prompt file selection ────────────────────────────────────────────────────
 if ($env:NEW_STATUS -eq 'In Progress') {
@@ -55,11 +187,8 @@ Status: $env:OLD_STATUS -> $env:NEW_STATUS
 "@
 
 # ── Log file ─────────────────────────────────────────────────────────────────
-$logDir = Join-Path $promptsDir 'logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+# $logDir and $safeTaskId are set above, before the Blocked branch that needs them.
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-$safeTaskId = ($env:TASK_ID -replace '[<>:"/\\|?*\s]+', '_')
-if (-not $safeTaskId) { $safeTaskId = 'unknown' }
 $safeStatus = ($env:NEW_STATUS -replace '[<>:"/\\|?*\s]+', '_')
 if (-not $safeStatus) { $safeStatus = 'unknown' }
 $logFile = Join-Path $logDir "$timestamp-$PID-$safeTaskId-$safeStatus.log"
@@ -70,13 +199,49 @@ $promptPath = "$logFile.prompt"
 if ($env:BACKLOG_DISPATCH_DRY_RUN -eq '1') { exit 0 }
 
 # ── Deduplication guard ───────────────────────────────────────────────────────
-# The onStatusChange hook can fire twice for the same event when the in-process
-# dispatch and the file-watcher dispatch race (both within the same millisecond).
+# The onStatusChange hook can fire more than once for the same event when the
+# in-process dispatch and the file-watcher dispatch race.
+#
+# ⚠️ This guard used to embed the CURRENT SECOND in the lock filename, making the
+# window exactly 1 second. Three dispatches arrived at 10:03:18, 10:03:21 and
+# 10:03:21: the two sharing a second deduped correctly, but 10:03:18 and 10:03:21
+# hashed to DIFFERENT keys — so two agents launched and attached to the same
+# worktree simultaneously, producing two parallel implementations of one feature
+# (duplicate request classes, duplicate services, an orphaned controller
+# dependency). Orphans of that kind still compile and still pass tests, because
+# nothing executes them.
+#
+# Fix: the lock name is keyed ONLY on (taskId, status) — no timestamp — and
+# staleness is decided by the lock file's AGE, not by its name. A second dispatch
+# inside the TTL is suppressed regardless of which second it lands on.
+$dedupeTtlSeconds = 90
+$dedupeLock = Join-Path $logDir "$safeTaskId-$safeStatus.dedup"
+
+# Clear the lock first if it is older than the TTL, so a legitimate re-dispatch
+# later (rework, relaunch of a stranded session) is never blocked forever.
+#
+# TOCTOU: Test-Path can succeed and the file be gone before Get-Item runs, when
+# two dispatches race. With $ErrorActionPreference='Stop' that THROWS and the
+# whole callback dies — observed as a wall of "Status change callback failed …
+# PathNotFound … Get-Item" that eventually took the Backlog.md server down.
+# -ErrorAction SilentlyContinue on Get-Item is not enough on its own: it returns
+# $null and then .LastWriteTime throws instead. Fetch the item ONCE, null-check
+# it, and swallow anything unexpected — failing to clear a stale lock must never
+# be fatal to dispatch.
+try {
+    $lockItem = Get-Item $dedupeLock -ErrorAction SilentlyContinue
+    if ($null -ne $lockItem) {
+        $lockAge = (Get-Date) - $lockItem.LastWriteTime
+        if ($lockAge.TotalSeconds -gt $dedupeTtlSeconds) {
+            Remove-Item $dedupeLock -Force -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    Write-Host "dispatch.ps1: stale-lock check skipped ($($_.Exception.Message))"
+}
+
 # File::Open with CreateNew is atomic on Windows: the first caller wins, the
 # second gets an IOException and exits — no second agent is launched.
-# The dedup key is per (taskId, status) within a 1-second window.
-$dedupeKey  = "$(Get-Date -Format 'yyyyMMdd-HHmmss')-$safeTaskId-$safeStatus.dedup"
-$dedupeLock = Join-Path $logDir $dedupeKey
 try {
     $s = [System.IO.File]::Open($dedupeLock,
              [System.IO.FileMode]::CreateNew,
@@ -84,19 +249,180 @@ try {
              [System.IO.FileShare]::None)
     $s.Close()
 } catch {
-    Write-Host "dispatch.ps1: duplicate suppressed for $env:TASK_ID -> $env:NEW_STATUS"
+    Write-Host "dispatch.ps1: duplicate suppressed for $env:TASK_ID -> $env:NEW_STATUS (within ${dedupeTtlSeconds}s dedup window)"
     exit 0
 }
-# Prune dedup files older than 60 s so they don't accumulate.
+
+# ── Ping-pong loop guard ──────────────────────────────────────────────────────
+# The dedup lock only stops SIMULTANEOUS dispatches. It does nothing about a task
+# bouncing coder -> In Review -> reviewer -> In Progress -> coder forever, each
+# hop a legitimate, well-spaced dispatch.
+#
+# One task did exactly that and burned TWO 5-hour provider usage windows before a
+# human noticed. Neither agent was misbehaving — the coder fixed what was asked,
+# the reviewer found something new each round. Nothing in the system was counting.
+#
+# Count the round trips per task and hard-stop past the threshold. A human then
+# decides whether the task needs re-scoping, a different agent, or splitting.
+# Reset by deleting the counter files (or let them age out after 24h).
+#
+# ⚠️ MUST be race-safe. A read -> increment -> write on a single counter file is a
+# lost-update race: when the hook storms (17 fires for ONE status change were
+# observed, caused by several Backlog.md server processes each firing
+# onStatusChange), every process reads the SAME value, every one writes value+1,
+# and every one concludes it is under the limit.
+#
+# Instead, each dispatch CLAIMS a hop number by atomically creating
+# "<task>.hop-NNN". File::Open with CreateNew is atomic, so exactly one process
+# can ever own a given number — no read-modify-write, nothing to race. The
+# claimed number IS the hop count.
+$maxRoundTrips = 6
+# A crash-recovery restart is NOT a round trip and must not consume the budget.
+# watchdog.ps1 re-fires a dead agent with OLD_STATUS = NEW_STATUS, a signature a
+# real transition never produces. Counting those as hops fenced one task after
+# only ONE review round: of its 7 hops, 3 were watchdog restarts. This guard
+# exists to stop coder/reviewer DISAGREEMENT, so it must count disagreement, not
+# crashes. The watchdog has its own independent retry cap for runaway restarts.
+$isCrashRecovery = ($env:OLD_STATUS -eq $env:NEW_STATUS)
+if (-not $isCrashRecovery -and ($env:NEW_STATUS -eq 'In Progress' -or $env:NEW_STATUS -eq 'In Review')) {
+    try {
+        # Age out a finished/abandoned cycle so a task is never blocked forever.
+        Get-ChildItem $logDir -Filter "$safeTaskId.hop-*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-24) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+        $trips = 0
+        for ($n = 1; $n -le ($maxRoundTrips + 1); $n++) {
+            $hopFile = Join-Path $logDir ("{0}.hop-{1:D3}" -f $safeTaskId, $n)
+            try {
+                $hs = [System.IO.File]::Open($hopFile,
+                          [System.IO.FileMode]::CreateNew,
+                          [System.IO.FileAccess]::ReadWrite,
+                          [System.IO.FileShare]::None)
+                $hs.Close()
+                $trips = $n
+                break
+            } catch {
+                # Someone already owns this hop number; try the next one.
+                continue
+            }
+        }
+
+        if ($trips -eq 0 -or $trips -gt $maxRoundTrips) {
+            Write-Host "dispatch.ps1: LOOP GUARD - $env:TASK_ID has exhausted $maxRoundTrips coder/reviewer hops. NOT dispatching."
+
+            # Park it in Blocked rather than leaving it where it stopped. Refusing
+            # to dispatch used to be the whole guard, which left the task sitting
+            # in In Progress/In Review looking exactly like a healthy one -- the
+            # only trace was a line in a log nobody reads. Moving it puts it on
+            # the board, in front of the person who has to decide.
+            #
+            # Safe to do from inside the hook: this status change re-enters
+            # dispatch.ps1, and Blocked falls through prompt selection to exit 0.
+            # The note goes in FIRST and without -s, so the reason is already on
+            # the task when the move lands and an annotation can never re-trigger
+            # anything on its own.
+            $blockedNote = @"
+Loop guard: fenced after $maxRoundTrips coder/reviewer hops without converging.
+Last transition: $env:OLD_STATUS -> $env:NEW_STATUS. Log: $logFile
+
+The agents were not misbehaving -- they simply kept disagreeing. A human needs to
+re-scope, split, reassign, or accept it. Moving this task out of Blocked clears
+the hop claims and the loop starts over.
+"@
+            # Run from the project root: the CLI locates the project by walking
+            # up from the working directory, and the hook inherits whatever cwd
+            # the server that fired it happened to have.
+            #
+            # $LASTEXITCODE, not try/catch: a native executable returning non-zero
+            # does not raise in PowerShell, so a catch block alone would report
+            # success for a task that never moved -- which is the one outcome that
+            # must not be reported wrongly, since nothing else is watching.
+            $parked = $false
+            $prevEap = $ErrorActionPreference
+            Push-Location $projectRoot
+            try {
+                # PowerShell 5.1 wraps a native command's stderr in an ErrorRecord
+                # and makes it TERMINATING while ErrorActionPreference is Stop --
+                # for an exe that exited 0 and merely warned, too. That would abort
+                # the parking after the move had already succeeded. Judge these two
+                # calls by exit code alone.
+                $ErrorActionPreference = 'Continue'
+                # --append-notes, never --notes: the latter REPLACES the notes
+                # section, which would delete the coder's and reviewer's record of
+                # the six rounds that are the whole reason this is being fenced.
+                & backlog task edit $env:TASK_ID --append-notes $blockedNote 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Host "dispatch.ps1: could not append the block reason to $env:TASK_ID (exit $LASTEXITCODE)." }
+                & backlog task edit $env:TASK_ID -s Blocked 2>&1 | Out-Null
+                $parked = ($LASTEXITCODE -eq 0)
+            } catch {
+                Write-Host "dispatch.ps1: parking $env:TASK_ID in Blocked failed ($($_.Exception.Message))."
+            } finally {
+                $ErrorActionPreference = $prevEap
+                Pop-Location
+            }
+
+            if ($parked) {
+                Write-Host "dispatch.ps1: $env:TASK_ID moved to Blocked for a human decision."
+            } else {
+                # A project whose statuses have no Blocked (or no CLI on PATH)
+                # keeps the old behaviour: fenced in place, nothing dispatched.
+                Write-Host "dispatch.ps1: $env:TASK_ID stays in $env:NEW_STATUS - no Blocked status configured, or the CLI is unavailable."
+                Write-Host "dispatch.ps1: a human must decide (re-scope, reassign, or split). Reset with: Remove-Item '$logDir\$safeTaskId.hop-*'"
+            }
+            exit 0
+        }
+        if ($trips -eq $maxRoundTrips) {
+            Write-Host "dispatch.ps1: WARNING - $env:TASK_ID is on hop $trips of $maxRoundTrips; the next one is blocked."
+        }
+    } catch {
+        Write-Host "dispatch.ps1: loop-guard bookkeeping failed ($($_.Exception.Message)) - continuing"
+    }
+}
+
+# Prune dedup files well past the TTL so they don't accumulate.
 Get-ChildItem $logDir -Filter '*.dedup' -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt (Get-Date).AddSeconds(-60) } |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddSeconds(-($dedupeTtlSeconds * 4)) } |
     Remove-Item -Force -ErrorAction SilentlyContinue
+
+# ── Dispatch-log retention ────────────────────────────────────────────────────
+# Nothing used to prune the dispatch logs themselves (.log/.err/.pid/.prompt/
+# .rework/.resume/.hop-NNN), so they accumulated indefinitely. One deployment's log
+# directory reached 48,967 files / 727 MB and had to be moved out by hand: a
+# retry storm on a single task wrote 29,720 files in one day (~3,000/hour) while
+# the normal rate had been 50-300/day for months. A directory that large is slow
+# to enumerate and makes any watcher over the project tree expensive.
+#
+# Keep 14 days — far longer than any post-mortem needs, and still bounded at a
+# few thousand files at normal rates. Capped per run so a huge backlog is chipped
+# away rather than stalling a dispatch, and wrapped so a pruning failure can
+# never block one.
+# The hop claims need a name match, not an extension one: PowerShell reads
+# ".hop-004" as the extension, so there is no fixed suffix to list. They are only
+# consulted within 24h -- the loop guard ages out anything older before it claims
+# -- so pruning them at 14 days cannot change a dispatch decision. Without this
+# they were the one thing here that nothing ever removed: a task that stops
+# dispatching keeps its claims forever, and one live deployment had 234 of them
+# going back three weeks.
+$logRetentionDays = 14
+$maxPrunePerRun = 500
+try {
+    Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -lt (Get-Date).AddDays(-$logRetentionDays) -and
+            ($_.Extension -in @('.log', '.err', '.pid', '.prompt', '.rework', '.resume') -or
+             $_.Name -like '*.hop-*')
+        } |
+        Select-Object -First $maxPrunePerRun |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "dispatch.ps1: log pruning skipped ($($_.Exception.Message))"
+}
 
 # ── Agent resolution ─────────────────────────────────────────────────────────
 # Tasks without `agent:` in frontmatter are human tasks -- skip dispatch.
 # Exception: Human Review always fires the notifier (ready.md).
 
-$projectRoot = (Resolve-Path (Join-Path $scriptDir '..\..') ).Path
 $tasksDir = Join-Path $projectRoot 'backlog\tasks'
 
 # ── Alias → binary resolution ─────────────────────────────────────────────────
@@ -337,16 +663,58 @@ if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
     $isPostReviewRework = $true
 }
 
+# Resuming a stranded session is safe ONLY when something EXTERNAL killed it
+# mid-work. If it exited cleanly believing it had already finished, resuming
+# reproduces that false belief -- a poisoned-resume loop that cost one task two
+# dispatch cycles, the resumed coder replying "already processed for that review
+# round" and never committing.
+#
+# Resolve it by evidence rather than by the signature alone: read the PREVIOUS
+# launch log's tail.
+#   provider-limit / hard-error signature -> died mid-work, resume keeps context
+#   anything else (including a clean exit) -> start FRESH, the context is suspect
+$strandedLogHasLimitSignature = $false
+$strandedLogReason = 'no previous coder log found'
+$prevCoderLog = Get-ChildItem $logDir -Filter "*$safeTaskId-In_Progress.log" -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $logFile } |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($prevCoderLog) {
+    $prevTail = (Get-Content $prevCoderLog.FullName -Tail 20 -ErrorAction SilentlyContinue) -join "`n"
+    if ($prevTail -match '(?i)(session limit|usage limit|rate limit|quota|insufficient balance|credit balance|turn\.failed|context low)') {
+        $strandedLogHasLimitSignature = $true
+        $strandedLogReason = "provider-limit signature in $($prevCoderLog.Name)"
+    } else {
+        $strandedLogReason = "no provider-limit signature in $($prevCoderLog.Name)"
+    }
+}
+
 $isStrandedRetry = $false
 if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
     $env:OLD_STATUS -eq 'In Progress' -and
     $env:NEW_STATUS -eq 'In Progress' -and
     $coderSessionId -ne '' -and
     -not $isPostReviewRework) {
-    $isStrandedRetry = $true
+    if ($strandedLogHasLimitSignature) {
+        $isStrandedRetry = $true
+    } else {
+        Write-Host "dispatch.ps1: stranded retry for $env:TASK_ID will launch FRESH, not resume ($strandedLogReason)"
+    }
 }
 
-$isCoderRework = $isPostReviewRework -or $isStrandedRetry
+# A third rework case: the project's test runner (Testing status, above) found a
+# red leg and bounced the task back here itself. This is neither a review verdict
+# nor a stranded-session retry — it has its own signature, OLD_STATUS=Testing —
+# but it should resume the coder's session the same way, because the failure log
+# was just appended to the task notes and the coder needs that context.
+$isTestFailureRetry = $false
+if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
+    $env:OLD_STATUS -eq 'Testing' -and
+    $env:NEW_STATUS -eq 'In Progress' -and
+    $coderSessionId -ne '') {
+    $isTestFailureRetry = $true
+}
+
+$isCoderRework = $isPostReviewRework -or $isStrandedRetry -or $isTestFailureRetry
 
 $isReviewerResume = $false
 if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
@@ -356,7 +724,9 @@ if ($resumeCapableAgents -contains $agentBinary.ToLower() -and
 }
 
 if ($isCoderRework) {
-    if ($isStrandedRetry) {
+    if ($isTestFailureRetry) {
+        $reworkMessage = "The automated test runner found a failing suite on task $env:TASK_ID and bounced it back to you. Read the task via the Backlog.md MCP (task_view) and find the latest run's notes -- they name what failed and include a log excerpt. Fix the failure, then move the task to Testing again (NOT In Review directly) so the suite re-runs. Do not try to run the full suite yourself; scoped/targeted tests are fine for fast iteration."
+    } elseif ($isStrandedRetry) {
         $reworkMessage = "Your previous session on task $env:TASK_ID was interrupted before finishing (e.g. a provider usage/rate limit) and no implementation was committed. Read the task via the Backlog.md MCP (task_view) and resume from where you left off -- you may already have useful context on the codebase in this session. Finish the implementation, run the tests, commit, and move the task to In Review when done."
     } else {
         $reworkMessage = "The reviewer requested changes on task $env:TASK_ID. Read the task via the Backlog.md MCP (task_view), find the latest Review section with CHANGES REQUESTED, address every finding, run the tests, and move the task back to In Review when done."

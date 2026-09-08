@@ -15,6 +15,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 prompts_dir="$script_dir"
 project_root="$(cd "$script_dir/../.." && pwd)"
 
+# ── Atomic file claim ─────────────────────────────────────────────────────────
+# The Windows dispatcher gets this from File::Open with CreateNew. The POSIX
+# equivalent is `set -C` (noclobber), under which `> file` fails if the file
+# already exists — the check and the create happen in one syscall (O_EXCL), so
+# exactly one racing process can ever win. A plain `[ -f ] && ...` test would be
+# a TOCTOU race and defeat the entire point of these guards.
+claim_file() {
+    if (set -C; : > "$1") 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # Set BACKLOG_DISPATCH_MODE=test in the env that launches Backlog.md to pick
 # the smoke-test prompts (no-op agents that just wait and transition to the
 # next status). Anything else uses the real prompts.
@@ -22,6 +35,87 @@ if [ "${BACKLOG_DISPATCH_MODE:-}" = "test" ]; then
     suffix=".test.md"
 else
     suffix=".md"
+fi
+
+# ── Testing status: hand off to the project's own test runner ─────────────────
+# OPT-IN, and not part of the default pipeline: a `Testing` column with no runner
+# behind it strands every task that enters it. To use it, add "Testing" to
+# `statuses:` in backlog/config.yml between In Progress and In Review, drop a
+# `run-full-suite.sh` next to this file, and have your coder prompt move finished
+# work to `Testing` instead of straight to `In Review`.
+#
+# The runner is project-specific — it knows how your suite boots — so none ships
+# here. Its contract: invoked as `run-full-suite.sh <taskId> <projectRoot>`, runs
+# detached for as long as it needs, and reports back through the backlog CLI
+# (all green -> In Review; any red -> In Progress with the failure in the notes).
+# A red result landing back in In Progress is picked up as a coder rework below.
+if [ "${NEW_STATUS:-}" = "Testing" ]; then
+    test_log_dir="$prompts_dir/logs"
+    mkdir -p "$test_log_dir"
+    test_runner="$prompts_dir/run-full-suite.sh"
+    safe_test_task_id="$(printf '%s' "${TASK_ID:-unknown}" | tr -c 'A-Za-z0-9._-' '_')"
+
+    if [ ! -f "$test_runner" ]; then
+        # Say so loudly: silence here looks exactly like a passing gate, and the
+        # task would sit in Testing forever with nobody able to tell why.
+        echo "dispatch.sh: task ${TASK_ID:-?} entered 'Testing' but no run-full-suite.sh exists next to this script." >&2
+        echo "dispatch.sh: it will sit there until a human moves it. Add a runner, or drop 'Testing' from statuses in backlog/config.yml." >&2
+        exit 0
+    fi
+
+    test_lock="$test_log_dir/$safe_test_task_id-Testing.dedup"
+    if [ -f "$test_lock" ]; then
+        test_lock_mtime="$(date -r "$test_lock" +%s 2>/dev/null || echo 0)"
+        if [ "$test_lock_mtime" -gt 0 ] && [ $(( $(date +%s) - test_lock_mtime )) -gt 90 ]; then
+            rm -f "$test_lock" 2>/dev/null || true
+        fi
+    fi
+    if ! claim_file "$test_lock"; then
+        echo "dispatch.sh: duplicate Testing dispatch suppressed for ${TASK_ID:-?} (within 90s dedup window)"
+        exit 0
+    fi
+
+    test_stamp="$(date +%Y%m%d-%H%M%S-%3N)"
+    test_log="$test_log_dir/$test_stamp-$$-$safe_test_task_id-Testing.log"
+    echo "dispatch.sh: task=${TASK_ID:-?} status=Testing -- launching run-full-suite.sh detached"
+    (
+        cd "$project_root"
+        nohup sh "$test_runner" "${TASK_ID:-}" "$project_root" > "$test_log" 2> "$test_log.err" &
+    ) >/dev/null 2>&1
+    exit 0
+fi
+
+# ── Per-task log paths ───────────────────────────────────────────────────
+# Set here rather than with the rest of the log setup further down, because the
+# Blocked branch below needs them and runs before any of that.
+log_dir="$prompts_dir/logs"
+mkdir -p "$log_dir"
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+safe_task_id="$(sanitize "${TASK_ID:-unknown}")"
+
+# ── Blocked ──────────────────────────────────────────────────────────────────
+# Where the loop guard parks a task it has fenced, and where a human parks one
+# that cannot proceed for any other reason (infra down, waiting on another task,
+# a decision nobody has made yet). Definition: NO FURTHER AUTOMATED PROGRESS IS
+# POSSIBLE UNTIL A PERSON ACTS.
+#
+# That deliberately excludes transient failures -- provider session limits, a
+# crashed MCP subprocess, a machine hiccup. Those resolve themselves or are
+# resumed by the watchdog, which finds them by the status they were dispatched
+# for; moving them here would hide them from the one thing that recovers them.
+#
+# Nothing dispatches on Blocked: the case below falls through to `exit 0`.
+#
+# LEAVING it is the interesting half. A human dragging a task out of Blocked is
+# the only signal that someone has looked at a fenced task and vouched for it, so
+# that is where the hop claims get cleared. Without this the task re-fences on
+# its first dispatch and the column becomes one tasks enter and never leave.
+if [ "${OLD_STATUS:-}" = "Blocked" ] && [ "${NEW_STATUS:-}" != "Blocked" ]; then
+    cleared="$(find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${cleared:-0}" -gt 0 ]; then
+        find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" -delete 2>/dev/null || true
+        echo "dispatch.sh: unblocked ${TASK_ID:-?} - cleared $cleared hop claim(s); the loop guard starts over."
+    fi
 fi
 
 case "${NEW_STATUS:-}" in
@@ -44,11 +138,8 @@ Task: ${TASK_ID:-?} — ${TASK_TITLE:-?}
 Status: ${OLD_STATUS:-?} → ${NEW_STATUS:-?}"
 
 # Per-invocation log file so concurrent hooks don't clobber each other.
-log_dir="$prompts_dir/logs"
-mkdir -p "$log_dir"
+# log_dir, sanitize() and safe_task_id are set above, before the Blocked branch.
 timestamp="$(date +%Y%m%d-%H%M%S-%3N)"
-sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
-safe_task_id="$(sanitize "${TASK_ID:-unknown}")"
 safe_status="$(sanitize "${NEW_STATUS:-unknown}")"
 log_file="$log_dir/$timestamp-$$-$safe_task_id-$safe_status.log"
 prompt_path="$log_file.prompt"
@@ -58,6 +149,128 @@ printf '%s' "$full_prompt" > "$prompt_path"
 if [ "${BACKLOG_DISPATCH_DRY_RUN:-}" = "1" ]; then
     exit 0
 fi
+
+# ── Deduplication guard ───────────────────────────────────────────────────────
+# The onStatusChange hook can fire more than once for the same event when the
+# in-process dispatch and the file-watcher dispatch race.
+#
+# The key is (taskId, status) ONLY — deliberately no timestamp. An earlier
+# Windows version embedded the current second, so two dispatches a few seconds
+# apart hashed to different keys and both launched, attaching two agents to one
+# worktree and producing two parallel implementations of the same feature.
+# Staleness is decided by the lock file's AGE instead.
+dedupe_ttl_seconds=90
+dedupe_lock="$log_dir/$safe_task_id-$safe_status.dedup"
+
+# Clear a lock older than the TTL so a legitimate later re-dispatch (rework, a
+# relaunch of a stranded session) is never blocked forever. Failure to clear one
+# must never be fatal, hence the redirected errors throughout.
+if [ -f "$dedupe_lock" ]; then
+    lock_mtime="$(date -r "$dedupe_lock" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"
+    if [ "$lock_mtime" -gt 0 ] && [ $((now_epoch - lock_mtime)) -gt "$dedupe_ttl_seconds" ]; then
+        rm -f "$dedupe_lock" 2>/dev/null || true
+    fi
+fi
+
+if ! claim_file "$dedupe_lock"; then
+    echo "dispatch.sh: duplicate suppressed for ${TASK_ID:-?} -> ${NEW_STATUS:-?} (within ${dedupe_ttl_seconds}s dedup window)"
+    exit 0
+fi
+
+# ── Ping-pong loop guard ──────────────────────────────────────────────────────
+# The dedup lock only stops SIMULTANEOUS dispatches. It does nothing about a task
+# bouncing coder -> In Review -> reviewer -> In Progress -> coder forever, each
+# hop a legitimate, well-spaced dispatch. One task did exactly that and burned
+# two 5-hour provider usage windows before a human noticed — neither agent
+# misbehaving, nothing counting.
+#
+# Each dispatch CLAIMS a hop number by atomically creating "<task>.hop-NNN"; the
+# claimed number IS the count. A read-increment-write counter would be a
+# lost-update race, and this hook has been observed firing 17 times for a single
+# status change when several Backlog.md processes each ran it.
+max_round_trips=6
+# A crash-recovery restart is NOT a round trip: watchdog.ps1 re-fires a dead
+# agent with OLD_STATUS = NEW_STATUS, a signature no real transition produces.
+# This guard exists to stop coder/reviewer DISAGREEMENT, so it counts
+# disagreement, not crashes.
+if [ "${OLD_STATUS:-}" != "${NEW_STATUS:-}" ] &&
+   { [ "${NEW_STATUS:-}" = "In Progress" ] || [ "${NEW_STATUS:-}" = "In Review" ]; }; then
+    # Age out a finished/abandoned cycle so a task is never blocked forever.
+    find "$log_dir" -maxdepth 1 -name "$safe_task_id.hop-*" -mmin +1440 -delete 2>/dev/null || true
+
+    trips=0
+    n=1
+    while [ "$n" -le $((max_round_trips + 1)) ]; do
+        hop_file="$(printf '%s/%s.hop-%03d' "$log_dir" "$safe_task_id" "$n")"
+        if claim_file "$hop_file"; then
+            trips="$n"
+            break
+        fi
+        n=$((n + 1))
+    done
+
+    if [ "$trips" -eq 0 ] || [ "$trips" -gt "$max_round_trips" ]; then
+        echo "dispatch.sh: LOOP GUARD - ${TASK_ID:-?} has exhausted $max_round_trips coder/reviewer hops. NOT dispatching."
+
+        # Park it in Blocked rather than leaving it where it stopped. Refusing to
+        # dispatch used to be the whole guard, which left the task sitting in
+        # In Progress/In Review looking exactly like a healthy one -- the only
+        # trace was a line in a log nobody reads. Moving it puts it on the board,
+        # in front of the person who has to decide.
+        #
+        # Safe from inside the hook: this status change re-enters dispatch.sh and
+        # Blocked falls through the case above to exit 0. The note goes in first
+        # and without -s, so the reason is on the task before the move lands.
+        #
+        # --append-notes, never --notes: the latter REPLACES the notes section,
+        # deleting the coder's and reviewer's record of the six rounds that are
+        # the whole reason this is being fenced.
+        blocked_note="Loop guard: fenced after $max_round_trips coder/reviewer hops without converging.
+Last transition: ${OLD_STATUS:-?} -> ${NEW_STATUS:-?}. Log: $log_file
+
+The agents were not misbehaving -- they simply kept disagreeing. A human needs to
+re-scope, split, reassign, or accept it. Moving this task out of Blocked clears
+the hop claims and the loop starts over."
+
+        # Run from the project root: the CLI locates the project by walking up
+        # from the working directory, and the hook inherits whatever cwd the
+        # server that fired it happened to have. Subshell so the cd cannot leak.
+        if (cd "$project_root" && backlog task edit "${TASK_ID:-}" --append-notes "$blocked_note" >/dev/null 2>&1); then
+            :
+        else
+            echo "dispatch.sh: could not append the block reason to ${TASK_ID:-?}."
+        fi
+        if (cd "$project_root" && backlog task edit "${TASK_ID:-}" -s Blocked >/dev/null 2>&1); then
+            echo "dispatch.sh: ${TASK_ID:-?} moved to Blocked for a human decision."
+        else
+            # A project whose statuses have no Blocked (or no CLI on PATH) keeps
+            # the old behaviour: fenced in place, nothing dispatched.
+            echo "dispatch.sh: ${TASK_ID:-?} stays in ${NEW_STATUS:-?} - no Blocked status configured, or the CLI is unavailable."
+            echo "dispatch.sh: a human must decide (re-scope, reassign, or split). Reset with: rm '$log_dir/$safe_task_id.hop-'*"
+        fi
+        exit 0
+    fi
+    if [ "$trips" -eq "$max_round_trips" ]; then
+        echo "dispatch.sh: WARNING - ${TASK_ID:-?} is on hop $trips of $max_round_trips; the next one is blocked."
+    fi
+fi
+
+# Prune dedup files well past the TTL so they don't accumulate.
+find "$log_dir" -maxdepth 1 -name '*.dedup' -mmin +6 -delete 2>/dev/null || true
+
+# ── Dispatch-log retention ────────────────────────────────────────────────────
+# Nothing used to prune these, and one deployment's log directory reached 48,967
+# files / 727 MB — a retry storm wrote 29,720 files in a single day. Keep 14
+# days: far longer than any post-mortem needs, still bounded. Never fatal.
+for ext in log err pid prompt rework resume; do
+    find "$log_dir" -maxdepth 1 -type f -name "*.$ext" -mtime +14 -delete 2>/dev/null || true
+done
+# Hop claims have no fixed suffix (.hop-001, .hop-002, ...) so they need their own
+# glob. Safe at 14 days: the loop guard ages out anything over 24h before it
+# claims, so a fortnight-old claim can no longer affect a dispatch. Without this
+# nothing ever removed them and a task that stops dispatching keeps them forever.
+find "$log_dir" -maxdepth 1 -type f -name '*.hop-*' -mtime +14 -delete 2>/dev/null || true
 
 # ── Agent resolution ─────────────────────────────────────────────────────────
 #

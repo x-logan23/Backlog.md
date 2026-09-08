@@ -35,6 +35,18 @@ const DoneIcon: React.FC<{ className?: string }> = ({ className = 'w-2.5 h-2.5' 
   </svg>
 );
 
+/**
+ * Pid alive, task still in this phase, but the log has gone quiet past the
+ * grace window. Distinct from both "running" and "done" on purpose: this is the
+ * stranded-session signature, and showing it as either would hide the one state
+ * that needs a human.
+ */
+const StrandedIcon: React.FC<{ className?: string }> = ({ className = 'w-2.5 h-2.5' }) => (
+  <svg className={`${className} text-amber-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-label="no output">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+  </svg>
+);
+
 const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEnd, status, laneId, hiddenFields = EMPTY_HIDDEN }) => {
   const [isDragging, setIsDragging] = React.useState(false);
   const [showBranchTooltip, setShowBranchTooltip] = React.useState(false);
@@ -119,10 +131,14 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
         </div>
       )}
 
+      {/* Shares the live agent panel's card language: a tinted header strip
+          carrying the identity, an unpadded container so each band runs edge to
+          edge, and a quiet footer. Padding lives on the bands, not the shell —
+          that is what lets the strips read as strips. */}
       <div
-        className={`bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-md p-3 mb-2 transition-all duration-200 ${
-          isFromOtherBranch 
-            ? 'opacity-75 cursor-not-allowed border-dashed' 
+        className={`bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg overflow-hidden mb-2 transition-all duration-200 ${
+          isFromOtherBranch
+            ? 'opacity-75 cursor-not-allowed border-dashed'
             : 'cursor-pointer hover:shadow-md dark:hover:shadow-lg hover:border-stone-500 dark:hover:border-stone-400'
         } ${getPriorityClass(task.priority)} ${
           isDragging ? 'opacity-50 transform rotate-2 scale-105' : ''
@@ -132,10 +148,11 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
         onDragEnd={handleDragEnd}
         onClick={() => onEdit(task)}
       >
-        {/* Cross-branch indicator banner */}
+        {/* Cross-branch indicator banner. A full-width band now that the shell
+            has no padding of its own — no negative margins to cancel it out. */}
         {isFromOtherBranch && (
-          <div className="flex items-center gap-1.5 mb-2 px-2 py-1 -mx-1 -mt-1 bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-700 rounded-t text-xs text-amber-700 dark:text-amber-300">
-            <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-700 text-[10px] text-amber-700 dark:text-amber-300">
+            <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
             </svg>
             <span className="truncate">
@@ -144,22 +161,22 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
           </div>
         )}
 
-        {/* Slot: header-left (id) + header-right (priority badge).
-            Container collapses when both slots are hidden so the title
-            doesn't shift down by a phantom mb-1.5. */}
+        {/* Header strip: id (mono, like the agent pane's) + priority chip.
+            Collapses entirely when both slots are hidden, so a stripped-down
+            card does not carry an empty tinted band. */}
         {(() => {
           const showId = !hiddenFields.has('id');
           const priorityBadge = !hiddenFields.has('priority') ? getPriorityBadge(task.priority) : null;
           if (!showId && !priorityBadge) return null;
           return (
-            <div className="flex items-center justify-between gap-2 mb-1.5">
+            <div className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-100 dark:border-gray-600/60 transition-colors duration-200">
               {showId ? (
-                <span className="text-xs text-gray-400 dark:text-gray-500 font-mono transition-colors duration-200">{task.id}</span>
+                <span className="text-xs font-mono font-semibold text-gray-700 dark:text-gray-200 transition-colors duration-200">{task.id}</span>
               ) : (
                 <span />
               )}
               {priorityBadge && (
-                <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded ${priorityBadge.bg} ${priorityBadge.text} transition-colors duration-200`}>
+                <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded shrink-0 ${priorityBadge.bg} ${priorityBadge.text} transition-colors duration-200`}>
                   {priorityBadge.label}
                 </span>
               )}
@@ -167,6 +184,8 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
           );
         })()}
 
+        {/* Body band — holds the title and every content slot below it. */}
+        <div className="px-3 py-2.5">
         {/* Title (always-on chrome). */}
         <h4 className={`font-semibold text-sm line-clamp-2 transition-colors duration-200 ${
           isFromOtherBranch
@@ -197,8 +216,9 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
         {(!hiddenFields.has('agent') && task.agent) || (!hiddenFields.has('reviewAgent') && task.reviewAgent) ? (
           <div className="flex flex-wrap gap-1 mt-2">
             {!hiddenFields.has('agent') && task.agent && (() => {
-              const running = agentStatus.coder?.running;
-              const done    = agentStatus.coder?.completed;
+              const running  = agentStatus.coder?.running;
+              const done     = agentStatus.coder?.completed;
+              const stranded = agentStatus.coder?.stranded;
               return (
                 <span
                   role="button"
@@ -208,11 +228,11 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
                       ? 'bg-blue-100 dark:bg-blue-800/50 text-blue-800 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-700/60'
                       : 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-800/40'
                   }`}
-                  title={`Coder agent: ${task.agent}${running ? ' (running)' : done ? ' (done)' : ''} — click to view log`}
+                  title={`Coder agent: ${task.agent}${running ? ' (running)' : stranded ? ' (no output — possibly stranded)' : done ? ' (done)' : ''} — click to view log`}
                   onClick={(e) => { e.stopPropagation(); setLogModal({ status: 'In Progress', agentName: task.agent! }); }}
                   onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); setLogModal({ status: 'In Progress', agentName: task.agent! }); } }}
                 >
-                  {running ? <SpinnerIcon /> : done ? <DoneIcon /> : (
+                  {running ? <SpinnerIcon /> : stranded ? <StrandedIcon /> : done ? <DoneIcon /> : (
                     <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
                     </svg>
@@ -222,8 +242,9 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
               );
             })()}
             {!hiddenFields.has('reviewAgent') && task.reviewAgent && (() => {
-              const running = agentStatus.reviewer?.running;
-              const done    = agentStatus.reviewer?.completed;
+              const running  = agentStatus.reviewer?.running;
+              const done     = agentStatus.reviewer?.completed;
+              const stranded = agentStatus.reviewer?.stranded;
               return (
                 <span
                   role="button"
@@ -233,11 +254,11 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
                       ? 'bg-purple-100 dark:bg-purple-800/50 text-purple-800 dark:text-purple-200 hover:bg-purple-200 dark:hover:bg-purple-700/60'
                       : 'bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-800/40'
                   }`}
-                  title={`Reviewer agent: ${task.reviewAgent}${running ? ' (running)' : done ? ' (done)' : ''} — click to view log`}
+                  title={`Reviewer agent: ${task.reviewAgent}${running ? ' (running)' : stranded ? ' (no output — possibly stranded)' : done ? ' (done)' : ''} — click to view log`}
                   onClick={(e) => { e.stopPropagation(); setLogModal({ status: 'In Review', agentName: task.reviewAgent! }); }}
                   onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); setLogModal({ status: 'In Review', agentName: task.reviewAgent! }); } }}
                 >
-                  {running ? <SpinnerIcon /> : done ? <DoneIcon /> : (
+                  {running ? <SpinnerIcon /> : stranded ? <StrandedIcon /> : done ? <DoneIcon /> : (
                     <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
@@ -268,15 +289,17 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
           </div>
         )}
 
-        {/* Footer row: createdDate (left) + first assignee (right).
-            When both slots are hidden, the divider/footer collapses too
-            so we don't render an empty border above blank space. */}
+        </div>
+
+        {/* Footer strip: createdDate (left) + first assignee (right), matching
+            the agent pane's meta row. Collapses whole when both slots are
+            hidden, so no empty band is rendered. */}
         {(() => {
           const showDate = !hiddenFields.has('createdDate');
           const showAssignee = !hiddenFields.has('assignee') && task.assignee.length > 0;
           if (!showDate && !showAssignee) return null;
           return (
-            <div className="flex items-center justify-between text-[10px] text-gray-400 dark:text-gray-500 mt-2 pt-1.5 border-t border-gray-100 dark:border-gray-600/50 transition-colors duration-200">
+            <div className="flex items-center justify-between px-3 py-1.5 text-[10px] text-gray-400 dark:text-gray-500 bg-gray-50/60 dark:bg-gray-800/30 border-t border-gray-100 dark:border-gray-600/60 transition-colors duration-200">
               {showDate ? <span>{formatRelativeDate(task.createdDate)}</span> : <span />}
               {showAssignee && (
                 <span className="truncate max-w-[80px]" title={task.assignee.join(', ')}>

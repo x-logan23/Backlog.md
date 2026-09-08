@@ -20,14 +20,42 @@ import reviewTestMd from "../../backlog/prompts/review.test.md" with { type: "te
 import readyTestMd from "../../backlog/prompts/ready.test.md" with { type: "text" };
 import tokenReportPs1 from "../../backlog/prompts/token-report.ps1" with { type: "text" };
 import createMrPs1 from "../../backlog/prompts/create-mr.ps1" with { type: "text" };
+import watchdogPs1 from "../../backlog/prompts/watchdog.ps1" with { type: "text" };
 // The MCP configs resolve as parsed JSON (tsc's built-in JSON module typing);
 // re-serialize them when scaffolding. The ${GITLAB_TOKEN} placeholder is a plain
 // string value and round-trips through JSON faithfully.
 import mcpCoderJson from "../../.claude/mcp-coder.json";
 import mcpReviewerJson from "../../.claude/mcp-reviewer.json";
 
-/** The five-stage pipeline the dispatch loop drives. */
-export const AGENT_LOOP_STATUSES = ["To Do", "In Progress", "In Review", "Human Review", "Done"] as const;
+/**
+ * The five-stage pipeline the dispatch loop drives, plus the parking bay it
+ * falls back to.
+ *
+ * `Blocked` is not a stage — it is an exit from the flow. The dispatch loop's
+ * guard fences a task that
+ * has bounced between coder and reviewer without converging, and before this the
+ * fenced task simply stayed where it stopped, indistinguishable on the board
+ * from a healthy one. Now it is parked here, in front of the person who has to
+ * decide, with the reason appended to its notes; moving it back out clears the
+ * hop claims and the loop starts over.
+ *
+ * It doubles as the manual "cannot proceed" column — infra down, waiting on
+ * another task, a decision nobody has made. Definition either way: no further
+ * automated progress is possible until a person acts.
+ *
+ * Unlike the opt-in `Testing` status, this one ships by default. `Testing`
+ * strands every task entering it unless the project supplies a runner; `Blocked`
+ * needs nothing behind it — nothing dispatches on it, by design. It does have to
+ * be in `statuses` for the dispatcher's `task edit -s Blocked` to succeed at all.
+ *
+ * ⚠️ It sits second-to-last, NOT last, and the position is load-bearing:
+ * `getTerminalStatus()` is defined as the final entry in this list, and that is
+ * what `getTerminalStatusTasksByAge()` archives by age and what the board hangs
+ * its cleanup affordance on. Appending `Blocked` after `Done` would point the
+ * cleanup at blocked tasks and stop it ever archiving finished ones. `Done` must
+ * stay last. Anything added here goes before it.
+ */
+export const AGENT_LOOP_STATUSES = ["To Do", "In Progress", "In Review", "Human Review", "Blocked", "Done"] as const;
 
 /**
  * Shell used to run the onStatusChange hook. PowerShell on Windows (the
@@ -77,6 +105,7 @@ export function buildAgentLoopFiles(backlogDir: string): ScaffoldFile[] {
 		{ path: `${p}/ready.test.md`, content: readyTestMd },
 		{ path: `${p}/token-report.ps1`, content: tokenReportPs1 },
 		{ path: `${p}/create-mr.ps1`, content: createMrPs1 },
+		{ path: `${p}/watchdog.ps1`, content: watchdogPs1 },
 		{ path: ".claude/mcp-coder.json", content: `${JSON.stringify(mcpCoderJson, null, 2)}\n` },
 		{ path: ".claude/mcp-reviewer.json", content: `${JSON.stringify(mcpReviewerJson, null, 2)}\n` },
 	];

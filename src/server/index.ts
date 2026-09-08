@@ -1,7 +1,22 @@
 import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { $ } from "bun";
+import {
+	type AgentEvent,
+	AgentFeedTail,
+	claudeProjectSlug,
+	deriveBadgeState,
+	extractSessionIds,
+	feedKindForBinary,
+	type FeedKind,
+	hopCount,
+	isLikelyRunning,
+	parseLogStem,
+	safeSegment,
+	type TokenTotals,
+} from "../core/agent-activity.ts";
 import { Core } from "../core/backlog.ts";
 import type { ContentStore } from "../core/content-store.ts";
 import { initializeProject } from "../core/init.ts";
@@ -245,6 +260,15 @@ export class BacklogServer {
 	private storeReadyBroadcasted = false;
 	private configWatcher: { stop: () => void } | null = null;
 	private watcherLockHolder: WatcherLockHolder | null = null;
+	/**
+	 * Incremental tails for /api/agent-activity, keyed by absolute feed path.
+	 *
+	 * A coder's Claude transcript passes 10 MB within a session and the board
+	 * polls every few seconds; without this the server would re-read and re-parse
+	 * the whole file on every poll. Each entry remembers its byte offset, so a
+	 * poll only parses what was appended since the last one.
+	 */
+	private agentFeeds = new Map<string, AgentFeedTail>();
 
 	constructor(projectPath: string) {
 		this.core = new Core(projectPath, { enableWatchers: true });
@@ -349,14 +373,16 @@ export class BacklogServer {
 		} else {
 			console.warn(
 				"⚠️  Another Backlog.md process holds the watcher lock for this project. " +
-					"File-watcher-driven onStatusChange dispatch will be handled by that process; " +
-					"this server will respond to API/MCP requests but won't install its own watcher.",
+					"onStatusChange dispatch will be handled by that process; " +
+					"this server still watches files so its own reads stay current.",
 			);
-			this.core.setEnableWatchers(false);
-			// Suppress in-process hook fires — the lock holder's watcher will
-			// observe our writes and dispatch instead. Without this gate the
-			// hook would fire twice (once here from dispatchInProcess, once
-			// from the lock holder's watcher).
+			// Watchers stay ON deliberately. They serve two separate purposes —
+			// keeping this process's task cache fresh, and firing the hook — and
+			// only the second one may be duplicated. Turning them off to avoid a
+			// double dispatch also froze the cache, so every API/MCP consumer was
+			// served stale tasks indefinitely behind that one startup warning.
+			// Suppression now lives in the dispatcher's isAuthority gate instead,
+			// which covers the watcher path and the in-process path alike.
 			this.core.setHookDispatchAuthority(false);
 		}
 
@@ -476,6 +502,9 @@ export class BacklogServer {
 					},
 					"/api/agent-log": {
 						GET: async (req: Request) => await this.handleGetAgentLog(req),
+					},
+					"/api/agent-activity": {
+						GET: async () => await this.handleGetAgentActivity(),
 					},
 					"/api/init": {
 						POST: async (req: Request) => await this.handleInit(req),
@@ -1811,6 +1840,114 @@ export class BacklogServer {
 		}
 	}
 
+	/**
+	 * Newest dispatch per (taskId, status), from the `.pid` files dispatch.ps1
+	 * writes after Start-Process. Stems are timestamp-prefixed, so lexicographic
+	 * order is chronological.
+	 */
+	private latestDispatches(files: readonly string[]): Map<string, { stem: string; taskId: string; status: string }> {
+		const latest = new Map<string, { stem: string; taskId: string; status: string }>();
+		for (const file of files) {
+			const parsed = parseLogStem(file, ".log.pid");
+			if (!parsed) continue;
+			const key = `${parsed.taskId}::${parsed.status}`;
+			const previous = latest.get(key);
+			if (!previous || previous.stem.localeCompare(parsed.stem) < 0) latest.set(key, parsed);
+		}
+		return latest;
+	}
+
+	/**
+	 * Whether one dispatch is really still working.
+	 *
+	 * Shared by /api/agent-status and /api/agent-activity on purpose: a liveness
+	 * rule enforced in one of them is enforced in neither, and the two disagreeing
+	 * would mean a card spinning while its pane says idle. See `isLikelyRunning`
+	 * for why a live pid alone is not evidence of anything.
+	 */
+	private async resolveLiveness(
+		logsDir: string,
+		stem: string,
+		/**
+		 * Authoritative current status of the dispatch's task, read on demand.
+		 * Called ONLY when the pid resolves, because that is the only case where
+		 * the status changes the answer — which keeps the cost at a couple of file
+		 * reads per poll instead of one per historical dispatch.
+		 */
+		resolveTaskStatus: () => Promise<string | null>,
+	): Promise<{
+		pidAlive: boolean;
+		statusMatches: boolean;
+		silentMs: number | null;
+		running: boolean;
+		lastWriteMs: number | null;
+	}> {
+		let pid = 0;
+		try {
+			pid = Number.parseInt((await Bun.file(join(logsDir, `${stem}.log.pid`)).text()).trim(), 10);
+		} catch {
+			// .pid unreadable — pid stays 0, i.e. not alive
+		}
+
+		let pidAlive = false;
+		if (pid > 0) {
+			try {
+				process.kill(pid, 0);
+				pidAlive = true;
+			} catch (e: unknown) {
+				// EPERM = alive but not ours to signal; ESRCH = really gone.
+				pidAlive = (e as NodeJS.ErrnoException).code === "EPERM";
+			}
+		}
+
+		let silentMs: number | null = null;
+		let lastWriteMs: number | null = null;
+		try {
+			const stat = await Bun.file(join(logsDir, `${stem}.log`)).stat();
+			lastWriteMs = stat.mtimeMs;
+			silentMs = Math.max(0, Date.now() - stat.mtimeMs);
+		} catch {
+			// log gone — leave null rather than inventing a time
+		}
+
+		// No live pid means nothing is working, whatever the task status says.
+		if (!pidAlive) {
+			return { pidAlive: false, statusMatches: false, silentMs, lastWriteMs, running: false };
+		}
+
+		const dispatchStatus = await resolveTaskStatus();
+		const statusMatches = dispatchStatus !== null;
+		return {
+			pidAlive,
+			statusMatches,
+			silentMs,
+			lastWriteMs,
+			running: isLikelyRunning({ pidAlive, statusMatches, silentMs }),
+		};
+	}
+
+	/**
+	 * Read one task's status straight from disk.
+	 *
+	 * Deliberately not the cached content store: when another process holds the
+	 * watcher lock this server installs no watcher, so its cache can sit stale
+	 * indefinitely with only a startup warning. A liveness rule built on a stale
+	 * status reports agents working on tasks that finished hours ago — the exact
+	 * lie this whole change exists to remove.
+	 */
+	private async freshTaskStatus(taskId: string, cachedId?: string): Promise<string | null> {
+		for (const candidate of [cachedId, taskId]) {
+			if (!candidate) continue;
+			try {
+				const task = await this.core.filesystem.loadTask(candidate);
+				if (task) return task.status;
+			} catch {
+				// unreadable / not found — try the next spelling
+			}
+		}
+		return null;
+	}
+
 	private async handleGetAgentStatus(): Promise<Response> {
 		const logsDir = join(this.core.filesystem.backlogDir, "prompts", "logs");
 		let files: string[];
@@ -1820,54 +1957,34 @@ export class BacklogServer {
 			return Response.json([]);
 		}
 
-		// .pid files are written by dispatch.ps1 after Start-Process and contain the
-		// actual agent's PID. Their stem matches the corresponding .log filename stem.
-		// Format: {yyyyMMdd-HHmmss-fff}-{dispatchPID}-{safeTaskId}-{safeStatus}.log.pid
-		// Split by '-': [0]=date [1]=time [2]=ms [3]=dispatchPID [4..n-2]=taskId [n-1]=status
-		const parsed: Array<{ stem: string; taskId: string; status: string }> = [];
-		for (const file of files) {
-			if (!file.endsWith(".log.pid")) continue;
-			const stem = file.slice(0, -8); // strip ".log.pid"
-			const parts = stem.split("-");
-			if (parts.length < 6) continue;
-			const status = (parts[parts.length - 1] ?? "").replace(/_/g, " ");
-			const taskId = parts.slice(4, parts.length - 1).join("-");
-			if (!taskId) continue;
-			parsed.push({ stem, taskId, status });
-		}
-
-		// Keep most recent .pid per (taskId, status) — stems are timestamp-prefixed so
-		// lexicographic sort is chronological.
-		const byKey = new Map<string, (typeof parsed)[number]>();
-		for (const entry of parsed.sort((a, b) => a.stem.localeCompare(b.stem))) {
-			byKey.set(`${entry.taskId}::${entry.status}`, entry);
-		}
+		// The cached store only supplies the task's canonical id spelling; the
+		// status itself is read fresh (see freshTaskStatus) and only when needed.
+		const store = await this.getContentStoreInstance().catch(() => null);
+		const idById = new Map((store?.getTasks() ?? []).map((task) => [task.id.toLowerCase(), task.id]));
 
 		const result = await Promise.all(
-			Array.from(byKey.values()).map(async ({ stem, taskId, status }) => {
-				let pid = 0;
-				try {
-					const raw = await Bun.file(join(logsDir, `${stem}.log.pid`)).text();
-					pid = parseInt(raw.trim(), 10);
-				} catch {
-					// .pid file unreadable — treat as completed
-				}
-
-				let running = false;
-				let completed = false;
-				if (pid > 0) {
-					try {
-						process.kill(pid, 0);
-						running = true;
-					} catch (e: unknown) {
-						// ESRCH = not found (finished); EPERM = exists, no permission (still running)
-						running = (e as NodeJS.ErrnoException).code === "EPERM";
-						completed = (e as NodeJS.ErrnoException).code === "ESRCH";
-					}
-				} else {
-					completed = true; // .pid missing or unreadable → dispatch finished
-				}
-				return { taskId, status, running, completed };
+			Array.from(this.latestDispatches(files).values()).map(async ({ stem, taskId, status }) => {
+				const { pidAlive, statusMatches, silentMs, running } = await this.resolveLiveness(
+					logsDir,
+					stem,
+					async () => {
+						const current = await this.freshTaskStatus(taskId, idById.get(taskId.toLowerCase()));
+						return current === status ? current : null;
+					},
+				);
+				const badge = deriveBadgeState({ running, pidAlive, statusMatches });
+				return {
+					taskId,
+					status,
+					running: badge === "running",
+					// A live pid with a long-silent feed is neither running nor cleanly
+					// finished — it is the stranded-session signature, and flattening it
+					// into either one hides the thing worth seeing.
+					stranded: badge === "stranded",
+					completed: badge === "completed",
+					pidAlive,
+					silentMs,
+				};
 			}),
 		);
 
@@ -1927,6 +2044,192 @@ export class BacklogServer {
 		} catch { /* no .pid → done */ }
 
 		return Response.json({ content: agentLogParse(raw, usedErr), done, logFile: matching });
+	}
+
+	/**
+	 * Structured live activity for every agent the dispatcher currently has out.
+	 *
+	 * This is the board-level companion to /api/agent-log: instead of one task's
+	 * raw text, it returns a normalized event stream, token totals, elapsed time
+	 * and loop-guard hop count for all active dispatches at once, so the UI can
+	 * show what each agent is doing without a request per card.
+	 *
+	 * The feed it reads depends on the agent, because they do not report equally:
+	 *   - claude is launched with plain `-p`, whose stdout is only the closing
+	 *     prose. The real record is Claude Code's own session transcript, so when
+	 *     the task recorded a session id we read that instead of the dispatch log.
+	 *   - codex is launched with `exec --json`, so its dispatch log is already a
+	 *     structured stream.
+	 *   - anything else falls back to the dispatch log as plain text.
+	 */
+	private async handleGetAgentActivity(): Promise<Response> {
+		const logsDir = join(this.core.filesystem.backlogDir, "prompts", "logs");
+		let files: string[];
+		try {
+			files = await readdir(logsDir);
+		} catch {
+			return Response.json([]);
+		}
+
+		const [config, store] = await Promise.all([
+			this.core.filesystem.loadConfig().catch(() => null),
+			this.getContentStoreInstance().catch(() => null),
+		]);
+		const tasks = store?.getTasks() ?? [];
+		const taskById = new Map(tasks.map((task) => [task.id.toLowerCase(), task]));
+
+		// Alias ("Claudio") -> binary ("claude"). A task may also name a binary
+		// directly, which is why the lookup falls back to the value itself.
+		const aliasToBinary = new Map((config?.agents ?? []).map((agent) => [agent.alias, agent.binary]));
+
+		const entries = await Promise.all(
+			Array.from(this.latestDispatches(files).values()).map(async ({ stem, taskId, status }) => {
+				const logPath = join(logsDir, `${stem}.log`);
+				const task = taskById.get(taskId.toLowerCase());
+
+				// Status is read fresh from disk, not taken from the cached store,
+				// which can sit stale when this server installed no watcher.
+				const currentStatus = await this.freshTaskStatus(taskId, task?.id);
+				// Drop historical dispatches — a task that has moved on is not being
+				// worked by this one, no matter what its recycled pid resolves to.
+				if (currentStatus !== status) return null;
+
+				const phase = status === "In Progress" ? "coder" : status === "In Review" ? "reviewer" : "notifier";
+				const agentName = (phase === "reviewer" ? task?.reviewAgent || task?.agent : task?.agent) ?? "";
+				const agentBinary = aliasToBinary.get(agentName) ?? agentName;
+				const kind = feedKindForBinary(agentBinary);
+
+				// Prefer Claude's own transcript — the dispatch log for `claude -p`
+				// carries no tool calls at all.
+				const sessionIds = extractSessionIds(task?.rawContent ?? "");
+				const sessionId = (phase === "reviewer" ? sessionIds.reviewer : sessionIds.coder) ?? null;
+				let feedPath = logPath;
+				let source: "claude-transcript" | "codex-json" | "log-text" = kind === "codex" ? "codex-json" : "log-text";
+				// Without a transcript, a claude dispatch log is prose — read it as text.
+				let feedKind: FeedKind = kind === "claude" ? "text" : kind;
+				if (kind === "claude" && sessionId) {
+					const transcript = join(
+						homedir(),
+						".claude",
+						"projects",
+						claudeProjectSlug(this.core.filesystem.rootDir),
+						`${sessionId}.jsonl`,
+					);
+					if (await Bun.file(transcript).exists()) {
+						feedPath = transcript;
+						source = "claude-transcript";
+						feedKind = "claude";
+					}
+				}
+
+				const feed = await this.readAgentFeed(feedPath, feedKind);
+				// Status was already confirmed fresh above, so the resolver is a
+				// constant here rather than a second read of the same file.
+				const liveness = await this.resolveLiveness(logsDir, stem, async () => status);
+				const pidAlive = liveness.pidAlive;
+
+				let startedAt: string | null = null;
+				let lastActivityAt: string | null = feed.lastEventAt ?? null;
+				try {
+					const stat = await Bun.file(logPath).stat();
+					startedAt = new Date(stat.birthtimeMs || stat.mtimeMs).toISOString();
+					// Codex events carry no timestamps, so fall back to the file's mtime.
+					if (!lastActivityAt) lastActivityAt = new Date(stat.mtimeMs).toISOString();
+				} catch {
+					// log file gone — leave these null rather than inventing a time
+				}
+
+				// Measure silence from the newest of the two sources: a claude
+				// transcript can be moving while the (prose-only) dispatch log it was
+				// dispatched with sits untouched for the whole session.
+				const newestMs = Math.max(liveness.lastWriteMs ?? 0, lastActivityAt ? Date.parse(lastActivityAt) : 0);
+				const silentMs = newestMs > 0 ? Math.max(0, Date.now() - newestMs) : null;
+				// statusMatches is true by construction: a mismatch returned null above.
+				const running = isLikelyRunning({ pidAlive, statusMatches: true, silentMs });
+
+				const maxHops = 6; // dispatch.ps1 $maxRoundTrips
+				return {
+					taskId,
+					taskTitle: task?.title ?? "",
+					status,
+					phase,
+					agentName,
+					agentBinary,
+					running,
+					// Surfaced separately on purpose: "pid alive but silent for hours" is
+					// the stranded-session signature, and must not be flattened away.
+					pidAlive,
+					silentMs,
+					startedAt,
+					lastActivityAt,
+					hop: hopCount(files, safeSegment(taskId)),
+					maxHops,
+					tokens: feed.tokens,
+					tokensPartial: feed.partial,
+					events: feed.events,
+					sessionId,
+					source,
+					logFile: `${stem}.log`,
+				};
+			}),
+		);
+
+		const active = entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+		// Running agents first, then most recently active.
+		active.sort((a, b) => {
+			if (a.running !== b.running) return a.running ? -1 : 1;
+			return (b.lastActivityAt ?? "").localeCompare(a.lastActivityAt ?? "");
+		});
+		return Response.json(active);
+	}
+
+	/**
+	 * Read whatever was appended to one agent feed since the last poll.
+	 *
+	 * A feed that has grown smaller than our offset was rotated or truncated
+	 * (a re-dispatch reusing the path), so the tail is reset rather than fed a
+	 * mid-file byte range that would parse as garbage.
+	 */
+	private async readAgentFeed(
+		path: string,
+		kind: FeedKind,
+	): Promise<{ events: AgentEvent[]; tokens: TokenTotals | null; lastEventAt?: string; partial: boolean }> {
+		let tail = this.agentFeeds.get(path);
+		if (!tail) {
+			tail = new AgentFeedTail(kind);
+			this.agentFeeds.set(path, tail);
+		}
+
+		let partial = false;
+		try {
+			const file = Bun.file(path);
+			const size = file.size;
+			if (size < tail.offset) tail.reset();
+
+			// First attach to an already-huge transcript: skip to the tail instead of
+			// parsing megabytes the user will never scroll to. Token totals are then
+			// only for the part we read, which `partial` tells the UI to say out loud
+			// rather than showing a confidently wrong number.
+			const MAX_INITIAL = 8 * 1024 * 1024;
+			if (tail.offset === 0 && size > MAX_INITIAL) {
+				tail.skipTo(size - MAX_INITIAL);
+				partial = true;
+			}
+
+			if (size > tail.offset) {
+				const chunk = await file.slice(tail.offset, size).text();
+				tail.push(chunk, size - tail.offset);
+			}
+		} catch {
+			// Unreadable feed (deleted, locked): keep whatever we already parsed.
+		}
+
+		return {
+			events: tail.recentEvents(40),
+			tokens: tail.tokenTotals().total > 0 ? tail.tokenTotals() : null,
+			lastEventAt: tail.lastEventAt(),
+			partial,
+		};
 	}
 
 	private async handleInit(req: Request): Promise<Response> {

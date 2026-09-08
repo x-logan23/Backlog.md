@@ -10,10 +10,56 @@ Drop-in templates for running a coder ↔ reviewer ↔ human-review loop on top 
 | `review.md` | Task → `In Review` | Audits the diff against acceptance criteria + DoD, writes structured findings into the task, moves to either `In Progress` (rework) or `Human Review` (approved). |
 | `ready.md` | Task → `Human Review` | Optional notifier. Prints a one-screen summary into the log file. Extend it if you want Slack/email notifications. |
 | `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. Also strips `ANTHROPIC_API_KEY` (forces subscription auth), scopes MCP servers per role, records token usage, and creates the MR on Human Review. |
-| `dispatch.sh` | All of the above (POSIX) | Same core loop, for `sh` / `bash`. |
+| `dispatch.sh` | All of the above (POSIX) | Same core loop and the same three guards, for `sh` / `bash`. Uses `set -C` (noclobber) for the atomic claims the Windows version gets from `File::Open CreateNew`. |
 | `token-report.ps1` | After a coder/reviewer session ends (Windows) | Reads the finished session's token usage out-of-band from its transcript; appends to `logs/tokens.csv` and a per-task line. Zero extra agent tokens. |
+| `watchdog.ps1` | On a timer (Windows) | Skips `Blocked` by an explicit rule. Nothing else notices when a dispatched agent *process* dies — a provider limit, a crashed MCP subprocess, a machine hiccup — and the task then sits in `In Progress` forever with nothing behind it. Run it from Task Scheduler every ~10 min: it finds those and re-fires the dispatcher. Stateless apart from per-task retry markers. |
 | `create-mr.ps1` | Task → `Human Review` (Windows, GitLab) | Deterministic, idempotent GitLab MR creation. Needs `GITLAB_PROJECT_ID` (skips cleanly when unset, e.g. GitHub) and a token via `GITLAB_TOKEN` / `.mcp.json` / codex config. |
 | `logs/` | (created on first run) | Per-invocation logs (`<timestamp>-<task_id>-<status>.log` plus `.err` for stderr). Inspect these when a hook misbehaves. |
+
+## The three guards
+
+Both dispatchers share these, and each exists because of a specific failure:
+
+- **Dedup lock** (90 s, keyed on `(taskId, status)`) — the hook can fire more than once for one event when the in-process dispatch and the file watcher race. The key deliberately carries **no timestamp**: an earlier version embedded the current second, so two dispatches seconds apart hashed differently, both launched, and two agents attached to one worktree and wrote two parallel implementations of the same feature.
+- **Ping-pong loop guard** (`.hop-NNN` claims, max 6; a fenced task is parked in `Blocked` — see below) — the dedup lock does nothing about a task bouncing coder → reviewer → coder forever, each hop legitimate. One task did exactly that and burned two 5-hour provider windows before anyone noticed. Hops are claimed atomically because a read-increment-write counter loses updates under a hook storm (17 fires for one status change has been observed). A watchdog restart (`OLD_STATUS == NEW_STATUS`) deliberately does **not** consume a hop — this counts disagreement, not crashes.
+- **Log retention** (14 days) — nothing used to prune `logs/`, and one deployment reached 48,967 files / 727 MB after a retry storm wrote 29,720 files in a day.
+
+## `Blocked`
+
+Where the loop guard parks a task it has fenced, and where you park one that cannot proceed for any other reason — infra down, waiting on another task, a decision nobody has made yet. One definition covers both: **no further automated progress is possible until a person acts.**
+
+Refusing to dispatch used to be the whole guard. That left the fenced task sitting in `In Progress` or `In Review` looking exactly like a healthy one, with the only trace a line in a log nobody reads — so it stopped moving and nobody found out until someone wondered why. It is now moved onto the board, with the reason appended to its notes.
+
+Nothing dispatches on `Blocked`: prompt selection falls through to a clean exit, so entering the column can never fire an agent. `watchdog.ps1` skips it by an explicit rule rather than by omission, because re-firing the dispatcher would restart exactly the loop the guard just stopped — on a timer, unattended.
+
+**Moving a task out of `Blocked` clears its hop claims**, and that is the point of the column rather than a convenience. Dragging it out is the only signal in the system that a person has looked at a fenced task and vouched for it, so the counter resets there and the loop starts over. Without it the task re-fences on its first dispatch and `Blocked` becomes a column tasks enter and never leave. Reset by hand — `rm backlog/prompts/logs/<TASK-ID>.hop-*`, or the PowerShell equivalent — only on a project whose statuses have no `Blocked`, where the dispatcher leaves the task fenced in place and says so in the log.
+
+**What does not belong here:** provider session limits, a crashed MCP subprocess, a machine hiccup. Those are transient — they resolve on their own or the watchdog resumes them, and it finds them by the status they were dispatched for. Moving them to `Blocked` hides them from the one thing that recovers them, and breaks the agent panel's liveness check, which requires a task still be in its dispatch status. Leave them where they are.
+
+Unlike `Testing`, `Blocked` ships by default: `Testing` strands every task entering it unless you supply a runner, whereas `Blocked` needs nothing behind it by design. It does have to be in `statuses:` for the dispatcher to move anything into it — and it must sit **before** `Done`, which has to stay last: the terminal status is defined as the final entry, and that is what the by-age cleanup archives.
+
+
+## Optional: an automated test gate (`Testing`)
+
+Both dispatchers understand a `Testing` status between `In Progress` and `In Review`, so a suite runs on every branch before a reviewer ever looks at it. It is **opt-in and off by default**, because a `Testing` column with nothing behind it strands every task that enters it. To turn it on:
+
+1. add `"Testing"` to `statuses:` in `backlog/config.yml`, between `In Progress` and `In Review`;
+2. drop a `run-full-suite.ps1` (Windows) or `run-full-suite.sh` (POSIX) next to the dispatcher;
+3. change your `code.md` so the coder's terminal state is `Testing`, not `In Review`.
+
+No runner ships here — it has to know how your suite boots. What it must honour is the contract:
+
+| | |
+|---|---|
+| **Invoked as** | `run-full-suite.ps1 -TaskId <id> -ProjectRoot <path>` · `run-full-suite.sh <taskId> <projectRoot>` |
+| **Runs** | detached, for as long as it needs — the dispatcher does not wait, and no agent session is blocked on it |
+| **On success** | move the task to `In Review` and append a pass summary |
+| **On failure** | move it back to `In Progress`, with the failing part and a log excerpt in the notes |
+| **Annotating only** | append notes *without* a status change, so a note can never re-trigger the hook |
+
+A red run landing the task back in `In Progress` is recognised by its `OLD_STATUS=Testing` signature and **resumes the coder's existing session** rather than starting a fresh one that has never seen the failure.
+
+If the status fires with no runner present, the dispatcher warns loudly and stops rather than passing silently — a silent skip is indistinguishable from a green gate.
 
 ## Prerequisites
 
@@ -25,7 +71,7 @@ Drop-in templates for running a coder ↔ reviewer ↔ human-review loop on top 
    The prompts assume this is available; the agents use it to read and write task state.
 3. **Required statuses in `backlog.config.yml`:**
    ```yaml
-   statuses: ["To Do", "In Progress", "In Review", "Human Review", "Done"]
+   statuses: ["To Do", "In Progress", "In Review", "Human Review", "Blocked", "Done"]
    ```
    The default Backlog.md install only has `To Do`, `In Progress`, `Done`. Add the two extras or rename the dispatcher's `case` branches to match your conventions.
 

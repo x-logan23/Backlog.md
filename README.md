@@ -57,7 +57,8 @@ backlog init "Personal Planning" --no-git
 
 > **This fork ships the multi-agent dispatch loop by default.** `backlog init`
 > provisions the full `To Do → In Progress → In Review → Human Review → Done`
-> pipeline, sets the `onStatusChange` dispatch hook (PowerShell on Windows, `sh`
+> pipeline plus a `Blocked` bay for tasks the loop cannot finish on its own,
+> sets the `onStatusChange` dispatch hook (PowerShell on Windows, `sh`
 > on POSIX), and scaffolds the prompt/dispatch/token-report/MR scripts under
 > `backlog/prompts/` plus the role-scoped MCP configs under `.claude/`. Want the
 > plain task-manager instead? Use [upstream Backlog.md](https://github.com/MrLesk/Backlog.md).
