@@ -253,4 +253,4 @@ El roadmap original de 5 tasks está completo. Ideas para iteraciones futuras:
 - **Board columns en el TUI** — el kanban del TUI (`board.ts`) sigue usando `config.statuses` directamente, ignorando `board.columns`. Consistencia con el browser.
 - **Métricas de ciclo** — tiempo promedio coder→reviewer, número de rework rounds, por tarea/sprint. Los logs del dispatcher ya tienen los timestamps.
 - **Configuración de `card.hide` en el TUI** — `TaskCard.tsx` es el componente web; el TUI tiene su propia vista de tarea en `board.ts`/`src/tui/`.
-- **Subir version de package.json** — actualmente sigue en `1.45.1` (upstream). Un bump a `1.46.0` o `2.0.0` diferenciaría el fork en `backlog --version`.
+- ~~**Subir version de package.json**~~ — hecho: el fork es `2.0.0`. La base upstream sigue siendo v1.45.1; el corte de numeración es deliberado, para que `backlog --version` nunca se confunda con una release de upstream.

@@ -310,9 +310,6 @@ the dispatcher and exits cleanly rather than doing anything surprising.
 2. **The 416-failure suite.** Its own body of work: triage by root cause first —
    a large share look like POSIX-shaped fixtures (`/bin/sh`, AF_UNIX binds), path
    separators and 5s subprocess timeouts, not 416 independent bugs.
-3. **`package.json` is still `1.45.1`** (upstream's). A bump would let
-   `backlog --version` distinguish the fork — carried over from
-   `FORK_CONTEXT.md`'s list and still true.
 
 **Ideas this work suggests:**
 
