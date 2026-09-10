@@ -35,7 +35,7 @@ let intervalId: ReturnType<typeof setInterval> | null = null;
 let consumerCount = 0;
 
 function notify() {
-	listeners.forEach(fn => fn());
+	for (const fn of listeners) fn();
 }
 
 async function poll() {

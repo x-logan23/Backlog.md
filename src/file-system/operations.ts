@@ -1692,7 +1692,7 @@ ${description || `Milestone: ${title}`}`,
 				out.push("  columns:");
 				for (const column of columns) {
 					out.push(`    - status: ${this.quoteYamlString(column.status)}`);
-					if (column.color && column.color.trim()) {
+					if (column.color?.trim()) {
 						out.push(`      color: ${this.quoteYamlString(column.color)}`);
 					}
 				}
