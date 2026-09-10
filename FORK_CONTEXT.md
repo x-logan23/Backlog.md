@@ -193,7 +193,12 @@ bun test src/test/task-write-coordinator.test.ts \
 bunx tsc --noEmit
 ```
 
-**Nota Windows:** La suite completa (`bun test`) tiene ~488 fallos pre-existentes en el upstream por `git init -b main` que requiere Git ≥ 2.28. Los fallos del fork son solo los tests de arriba — todos deben pasar.
+**Nota Windows:** La suite necesita **Git ≥ 2.28** y una entrada `safe.directory` para `tmp/`. Con ambas: 1403 pass / 42 fail / 6 skip (medido 2026-09-09 con Git 2.55.0.windows.5). Sin ellas no: con Git 2.27 fallan 410 (`git init -b main` → `unknown switch \`b'`, la opcion existe desde 2.28); y **solo actualizar Git empeora la cosa** — sube a 508. Este repo vive en `D:`, que es **exFAT** y no registra ownership, y Git ≥ 2.35.2 rechaza los repos cuyo duenyo no puede verificar: cada repo de prueba bajo `<repo>/tmp/` queda rechazado (aparece como `fatal: not in a git directory`), y el checkout principal tambien — `git status` deja de funcionar al actualizar. Hacen falta dos entradas, y el `/*` final SI funciona:
+```
+git config --global --add safe.directory D:/1064n/Programacion/claude/Backlog.md
+git config --global --add safe.directory "D:/1064n/Programacion/claude/Backlog.md/tmp/*"
+```
+Git Bash y Git for Windows son el mismo paquete: actualizar uno actualiza el otro. Los fallos del fork son solo los tests de arriba — todos deben pasar.
 
 ---
 

@@ -282,14 +282,57 @@ the dispatcher and exits cleanly rather than doing anything surprising.
   `bun run build && bun run install:local`, then restart. Running straight from
   source always reflects the checkout:
   `bun run <fork>/src/cli.ts browser --port 6499 --no-open`.
-- **`bun test` is red at 416 failures on Windows at `b5ad734`, before any of this
-  work.** Verified by stashing and running a clean checkout: identical count.
-  `FORK_CONTEXT.md` says ~488; 416 is the current measurement. Judge a change by
-  **diffing failing test names**, not the count — churn inside
-  `CLI Priority Filtering` is timeout flake and moves run to run.
-- **The suite writes into the working tree** — it modifies `src/web/styles/style.css`
-  and creates `backlog/docs/doc-4 - No-Git-Doc.md`. Enough to break `git stash pop`
-  mid-work. Clean those before committing.
+- **`bun test` needs Git ≥ 2.28 AND a `safe.directory` entry for `tmp/`.** With
+  both in place the suite is *mostly green*: **1403 pass / 42 fail / 6 skip** across
+  1451 tests (measured 2026-09-09, Git 2.55.0.windows.5). Without them it is not,
+  and the two failure modes look nothing alike:
+
+  | state | result | error |
+  |---|---|---|
+  | Git 2.27 | 410 fail | ``git init -b main`` → ``unknown switch `b'`` |
+  | Git 2.55, no safe.directory | **508 fail** | `fatal: detected dubious ownership` |
+  | Git 2.55 + `tmp/*` entry | **42 fail** | assorted, see below |
+
+  `git init -b` arrived in Git **2.28**; every suite opens with it (47 of 170 files,
+  76 calls), so an older Git fails them all in `beforeEach`. Git Bash and Git for
+  Windows are one package — upgrading either upgrades both.
+
+  Upgrading alone makes things *worse*, which is the trap. **This repo lives on
+  `D:`, which is exFAT**, a filesystem that records no ownership. Git ≥ **2.35.2**
+  refuses repos it cannot prove ownership of, so every fixture repo under
+  `<repo>/tmp/` is rejected — surfacing confusingly as `fatal: not in a git
+  directory` from the following `git config`, because git had already declined to
+  see a repo there. The main checkout is rejected too: `git status` in this repo
+  stops working the moment you upgrade.
+
+  Two entries are needed, and a trailing `/*` **is** honoured (verified), so the
+  ownership check stays on everywhere else:
+
+  ```
+  git config --global --add safe.directory D:/1064n/Programacion/claude/Backlog.md
+  git config --global --add safe.directory "D:/1064n/Programacion/claude/Backlog.md/tmp/*"
+  ```
+
+  Judge a change by **diffing failing test names** against this 42, not by the count.
+
+- **The remaining 42 are not yet triaged**, but they cluster. Roughly 14 are
+  git-commit related — `Auto-commit configuration`, `CLI Auto-Commit Behavior`,
+  `MCP milestone tools`, `CLI Integration > git integration` — and they fail on
+  `isClean()` returning false *after* the commit count assertion passed, i.e. the
+  commit happens and something is left dirty behind it. Not exFAT: a
+  git-init/write/commit/status cycle was compared on exFAT and NTFS and both came
+  back clean, so suspect the app's own staging logic. Another 9 are timeouts, and
+  the rest are assorted (`editTaskInTui`, `CLI Priority Filtering`, the known
+  `dispatch.ps1` stdin test).
+
+- **The suite writes into the project's own `backlog/` directory** — it does not
+  confine itself to temp fixtures. Seen so far: it modifies
+  `src/web/styles/style.css`, creates `backlog/docs/doc-4 - No-Git-Doc.md`, and
+  **promotes `backlog/drafts/draft-1` into `backlog/tasks/back-466`** (a real
+  draft in this repo, deleted and rewritten as a task). The exact set varies by
+  run. Check `git status` after every `bun test` and revert what you did not
+  intend — it is enough to break `git stash pop` mid-work, and the draft
+  promotion is easy to mistake for real work and commit by accident.
 - **`biome check` fails on `src/server/index.ts` and `task-hook-dispatcher.ts` at
   HEAD too**: the repo stores LF, Windows checks out CRLF. Pre-existing; do not
   "fix" it with a reformat. Note biome's `files.includes` is `src/**/*.ts` — it
@@ -307,9 +350,9 @@ the dispatcher and exits cleanly rather than doing anything surprising.
 1. **`dispatch.sh` has no stranded-retry path.** Safe (it launches fresh) but a
    real feature gap versus `dispatch.ps1`. Left rather than written blind, since a
    resume path cannot be exercised without live agents.
-2. **The 416-failure suite.** Its own body of work: triage by root cause first —
-   a large share look like POSIX-shaped fixtures (`/bin/sh`, AF_UNIX binds), path
-   separators and 5s subprocess timeouts, not 416 independent bugs.
+2. **The ~16 non-Git test failures.** Small once Git ≥ 2.28 is installed (see
+   above), and worth a look then: the auto-commit `isClean()` trio may be real,
+   the ~5000 ms timeouts are probably fixture latency rather than bugs.
 
 **Ideas this work suggests:**
 
