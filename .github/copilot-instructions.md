@@ -48,3 +48,5 @@ are found, the commit will be blocked until fixed.
 
 - **Branching**: Use feature branches when working on tasks (e.g. `tasks/task-123-feature-name`)
 - **Committing**: Use the following format: `TASK-123 - Title of the task`
+- **Never push directly to `main`** — every change reaches it through a pull request,
+  including one-line and docs-only edits. See AGENTS.md for the full rule.
