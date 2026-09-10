@@ -8,6 +8,7 @@ import {
 	readFileSync,
 	realpathSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -181,6 +182,66 @@ describe("dispatch.sh — target repository resolution", () => {
 		// Hop claims count coder/reviewer disagreement, not misconfiguration.
 		const logs = readdirSync(join(promptsDir, "logs"));
 		expect(logs.some((f) => f.includes(".hop-"))).toBe(false);
+	});
+});
+
+describe("dispatch.sh — the fallback lookup cannot select a neighbouring task", () => {
+	guarded("ignores a substring match whose frontmatter id is a different task", () => {
+		// The anchored pattern misses "BACK-12 notes.md" (no " - " after the id),
+		// so the loose fallback runs and matches it for BACK-1. Without the id
+		// check that would hand BACK-12's repo to BACK-1's agent.
+		scratchBase = mkdtempSync(join(tmpdir(), "backlog-dispatch-sh-"));
+		const projectRoot = join(scratchBase, "project");
+		const promptsDir = join(projectRoot, "backlog", "prompts");
+		const tasksDir = join(projectRoot, "backlog", "tasks");
+		mkdirSync(join(promptsDir, "logs"), { recursive: true });
+		mkdirSync(tasksDir, { recursive: true });
+		mkdirSync(join(projectRoot, "wrong-repo", ".git"), { recursive: true });
+		writeFileSync(join(promptsDir, "dispatch.sh"), readFileSync(dispatcherPath, "utf8"), { mode: 0o755 });
+		writeFileSync(join(promptsDir, "code.md"), "Coder prompt body.\n");
+		writeFileSync(
+			join(tasksDir, "BACK-12 notes.md"),
+			"---\nid: BACK-12\ntitle: Other task\nstatus: To Do\nassignee: []\ncreated_date: '2026-01-01'\nlabels: []\ndependencies: []\nagent: claude\nrepo: wrong-repo\n---\n",
+		);
+
+		const result = runDispatcher(join(promptsDir, "dispatch.sh"));
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("its id (BACK-12) is not BACK-1");
+		// Falls back to the project root rather than BACK-12's repository.
+		// Unresolved here, not `realpathSync`: with no repo the dispatcher keeps
+		// the project root exactly as it derived it, and only resolves a path it
+		// has to containment-check.
+		expect(result.stdout).toContain(`workdir=${projectRoot}`);
+		expect(result.stdout).not.toContain("wrong-repo");
+	});
+
+	guarded("still resolves normally when the matched file's id agrees", () => {
+		const { projectRoot, realProjectRoot, scratchDispatcher } = makeProject("repo: payments-api\n");
+		mkdirSync(join(projectRoot, "payments-api", ".git"), { recursive: true });
+		const result = runDispatcher(scratchDispatcher);
+		expect(result.stdout).toContain(`workdir=${join(realProjectRoot, "payments-api")}`);
+		expect(result.stdout).not.toContain("ignoring");
+	});
+});
+
+describe("dispatch.sh — symlinked repositories", () => {
+	guarded("rejects a symlink inside the project root that points outside it", () => {
+		// The POSIX dispatcher resolves links with `pwd -P` before the
+		// containment check, so the link's target is what gets judged. The
+		// Windows dispatcher cannot resolve them on PowerShell 5.1 and refuses
+		// to traverse one instead.
+		const { projectRoot, scratchDispatcher } = makeProject("repo: escape\n");
+		symlinkSync(join(String(scratchBase), "outside"), join(projectRoot, "escape"), "dir");
+		const result = runDispatcher(scratchDispatcher);
+		expect(result.stdout).toContain("resolves outside the project root");
+	});
+
+	guarded("accepts a symlink that stays inside the project root", () => {
+		const { projectRoot, realProjectRoot, scratchDispatcher } = makeProject("repo: alias\n");
+		mkdirSync(join(projectRoot, "payments-api", ".git"), { recursive: true });
+		symlinkSync(join(projectRoot, "payments-api"), join(projectRoot, "alias"), "dir");
+		const result = runDispatcher(scratchDispatcher);
+		expect(result.stdout).toContain(`workdir=${join(realProjectRoot, "payments-api")}`);
 	});
 });
 

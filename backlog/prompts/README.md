@@ -65,7 +65,9 @@ The dispatcher then launches the agent **inside** `payments-api` rather than at 
 
 `repo:` is a path relative to the project root, so `payments-api` and `platform/billing` both work. A task without one runs at the project root exactly as before.
 
-**When a repo cannot be used** — it does not exist, is not a directory, is not a git repository, or resolves outside the project root — the dispatcher launches nothing, appends the reason to the task's notes and moves it to `Blocked`. The last of those is a guard, not a formality: agents are launched with permissions skipped, so a task must never be able to point one at an arbitrary directory. Traversal (`../elsewhere`) and absolute paths are both rejected, and the check is done on the resolved path so symlinks cannot smuggle you out either.
+**When a repo cannot be used** — it does not exist, is not a directory, is not a git repository, or resolves outside the project root — the dispatcher launches nothing, appends the reason to the task's notes and moves it to `Blocked`. The last of those is a guard, not a formality: agents are launched with permissions skipped, so a task must never be able to point one at an arbitrary directory. Traversal (`../elsewhere`) and absolute paths are both rejected.
+
+Links are where the two dispatchers deliberately differ. `dispatch.sh` resolves them (`cd` + `pwd -P`) and judges the real destination, so a symlink pointing outside the project is rejected while one pointing inside is fine. `dispatch.ps1` targets PowerShell 5.1, which has no way to resolve a reparse point, and `GetFullPath` only collapses `..` as a string — so it **refuses to traverse a junction or symlink at all**, ancestors included. On Windows a junction needs neither admin rights nor Developer Mode, so refusing is the safe direction when the destination cannot be verified. If you want a Windows repo reachable through a link, give the real path instead.
 
 Unusable-repo rejection happens *before* the dedup and hop guards, so a typo never burns a hop claim — those count coder/reviewer disagreement, not misconfiguration.
 

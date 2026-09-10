@@ -151,6 +151,22 @@ if [ -z "$task_file" ]; then
     task_file="$(find "$project_root/backlog/tasks" -name "*${TASK_ID:-}*" 2>/dev/null | head -1 || true)"
 fi
 
+# Confirm the file actually is this task before anything trusts its `repo:`.
+#
+# The fallback above is a substring match, so BACK-1 can still select BACK-12's
+# file when a project uses a filename the anchored pattern does not fit. The id
+# in the frontmatter is the authority, and it is free to check because the file
+# is read either way. A file carrying no `id:` at all is left alone rather than
+# rejected, so an unusual-but-valid project keeps dispatching.
+if [ -n "$task_file" ] && [ -f "$task_file" ]; then
+    found_id="$(grep -m1 '^id:' "$task_file" 2>/dev/null | sed "s/^id:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
+    if [ -n "$found_id" ] &&
+       [ "$(printf '%s' "$found_id" | tr 'A-Z' 'a-z')" != "$(printf '%s' "${TASK_ID:-}" | tr 'A-Z' 'a-z')" ]; then
+        echo "dispatch.sh: ignoring $task_file - its id ($found_id) is not ${TASK_ID:-?}."
+        task_file=""
+    fi
+fi
+
 # ── Target repository resolution ─────────────────────────────────────────────
 # A task may name the repository it targets (frontmatter `repo:`), so a single
 # hub backlog can drive work across sibling repositories. The value is a path

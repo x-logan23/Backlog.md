@@ -251,12 +251,28 @@ if (-not $taskFile) {
 # Deliberately side-effect free, and placed before the dry-run gate and before
 # the dedup and hop guards -- a misconfigured repo must not burn a hop claim,
 # which counts coder/reviewer disagreement, not typos.
-$taskRepo = ''
+$taskFileContent = ''
 if ($taskFile) {
     $taskFileContent = Get-Content $taskFile.FullName -Raw
-    if ($taskFileContent -match '(?m)^repo:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-        $taskRepo = $matches[1].Trim()
+    # Confirm the file actually is this task before anything trusts its `repo:`.
+    # The fallback lookup above is a substring match, so BACK-1 can still select
+    # BACK-12's file when a project uses a filename the anchored pattern does not
+    # fit. The frontmatter id is the authority, and it is free to check because
+    # the file is read either way. A file carrying no `id:` at all is left alone
+    # rather than rejected, so an unusual-but-valid project keeps dispatching.
+    if ($taskFileContent -match '(?m)^id:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
+        $foundId = $matches[1].Trim()
+        if ($foundId -ne $env:TASK_ID) {
+            Write-Host "dispatch.ps1: ignoring $($taskFile.Name) - its id ($foundId) is not $env:TASK_ID."
+            $taskFile = $null
+            $taskFileContent = ''
+        }
     }
+}
+
+$taskRepo = ''
+if ($taskFileContent -and $taskFileContent -match '(?m)^repo:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
+    $taskRepo = $matches[1].Trim()
 }
 
 $agentWorkDir = $projectRoot
@@ -267,14 +283,45 @@ if ($taskRepo) {
     } else {
         # GetFullPath normalizes any ".." segments, so the containment check
         # below sees the real destination rather than the string written down.
+        #
+        # It is a pure string operation, though: it does NOT follow reparse
+        # points, so a junction inside the project root pointing outside it
+        # would pass the prefix test below and hand an agent a working
+        # directory outside the project. dispatch.sh does not have this hole,
+        # because `cd` + `pwd -P` resolves links before the check.
+        #
+        # PowerShell 5.1 has no ResolveLinkTarget, so rather than resolve, we
+        # REFUSE to traverse a reparse point at all -- see the walk below.
         $projectRootFull = [System.IO.Path]::GetFullPath($projectRoot)
         $candidate = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $taskRepo))
         $sep = [System.IO.Path]::DirectorySeparatorChar
         $rootPrefix = $projectRootFull.TrimEnd($sep) + $sep
+
+        # Walk the candidate and every ancestor down to the project root. The
+        # leaf alone is not enough: `repo: link/inner` hides the junction in an
+        # ancestor, and only the leaf would look ordinary.
+        $crossesLink = $false
+        $rootTrimmed = $projectRootFull.TrimEnd($sep)
+        $probe = $candidate.TrimEnd($sep)
+        while ($probe.Length -gt $rootTrimmed.Length) {
+            if (Test-Path -LiteralPath $probe) {
+                $attrs = (Get-Item -LiteralPath $probe -Force).Attributes
+                if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $crossesLink = $true; break }
+            }
+            $parent = [System.IO.Path]::GetDirectoryName($probe)
+            if (-not $parent -or $parent -eq $probe) { break }
+            $probe = $parent.TrimEnd($sep)
+        }
+
         if (-not $candidate.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             # An agent launches with permissions skipped, so a task must never
             # be able to point one at somewhere outside the project.
             $repoError = "resolves outside the project root ($candidate)"
+        } elseif ($crossesLink) {
+            # Stricter than the POSIX dispatcher, which can resolve the link and
+            # accept one that stays inside the project. Refusing is the safe
+            # direction when the destination cannot be verified.
+            $repoError = "path crosses a junction or symlink, whose target cannot be verified on PowerShell 5.1"
         } elseif (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
             $repoError = "no such directory: $candidate"
         } elseif (-not (Test-Path -LiteralPath (Join-Path $candidate '.git'))) {
