@@ -1468,6 +1468,8 @@ taskCmd
 	.option("--final-summary <text>", "add final summary")
 	.option("--ordinal <number>", "set task ordinal for custom ordering")
 	.option("-m, --milestone <milestone>", "assign task to milestone by ID or title")
+	.option("--agent <agent>", "assign the coder agent for the dispatch loop (alias from config `agents`, or a binary name)")
+	.option("--review-agent <agent>", "assign the reviewer agent (defaults to --agent when omitted)")
 	.option("--draft")
 	.option("-p, --parent <taskId>", "specify parent task ID")
 	.option(
@@ -1577,6 +1579,8 @@ taskCmd
 				acceptanceCriteria: criteria.map((text) => ({ text, checked: false })),
 				definitionOfDoneAdd: toStringArray(options.dod),
 				disableDefinitionOfDoneDefaults: options.dodDefaults === false,
+				agent: options.agent ? String(options.agent) : undefined,
+				reviewAgent: options.reviewAgent ? String(options.reviewAgent) : undefined,
 			});
 
 			if (usePlainOutput) {
@@ -2122,6 +2126,8 @@ taskCmd
 	.option("--ordinal <number>", "set task ordinal for custom ordering")
 	.option("-m, --milestone <milestone>", "assign task to milestone by ID or title")
 	.option("--clear-milestone", "clear task milestone assignment")
+	.option("--agent <agent>", "set the coder agent for the dispatch loop (empty string clears it)")
+	.option("--review-agent <agent>", "set the reviewer agent (empty string clears it)")
 	.option("--plain", "use plain text output after editing")
 	.option("--add-label <label>")
 	.option("--remove-label <label>")
@@ -2397,6 +2403,14 @@ taskCmd
 		}
 		if (removeLabelValues.length > 0) {
 			editArgs.removeLabels = removeLabelValues;
+		}
+		// An empty string is meaningful here: the shared builder forwards it and the
+		// core edit reads it as "clear this field", so test for presence, not truth.
+		if (options.agent !== undefined) {
+			editArgs.agent = String(options.agent);
+		}
+		if (options.reviewAgent !== undefined) {
+			editArgs.reviewAgent = String(options.reviewAgent);
 		}
 		if (assigneeValues.length > 0) {
 			editArgs.assignee = assigneeValues;
