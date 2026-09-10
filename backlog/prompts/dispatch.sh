@@ -9,7 +9,18 @@
 # Picks the prompt file matching $NEW_STATUS, reads the per-task agent/reviewAgent
 # field from the task frontmatter, and launches the right CLI in the background.
 
-set -euo pipefail
+set -eu
+
+# `pipefail` is not POSIX. dash only gained it in 0.5.12, and an older dash --
+# which is what /bin/sh is on some Debian and Ubuntu images -- answers
+# "Illegal option -o pipefail" and exits 2 before doing anything at all, which
+# is the whole dispatch loop dead with a message nobody reads. Ask for it in a
+# subshell first and carry on without it where it is missing: every pipeline
+# whose failure would matter here is already guarded with `|| true`, so its
+# absence changes no behaviour.
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
 
 # $0, not ${BASH_SOURCE[0]}: the array subscript is a bashism, and this script
 # is invoked as `sh dispatch.sh` by the hook. Under dash -- which IS /bin/sh on
