@@ -177,6 +177,8 @@ function hasCreateFieldFlags(options: Record<string, unknown>): boolean {
 			options.priority !== undefined ||
 			options.ordinal !== undefined ||
 			options.milestone !== undefined ||
+			options.agent !== undefined ||
+			options.reviewAgent !== undefined ||
 			options.repo !== undefined ||
 			options.plain ||
 			options.ac !== undefined ||
@@ -207,6 +209,8 @@ function hasEditFieldFlags(options: Record<string, unknown>): boolean {
 			options.priority !== undefined ||
 			options.ordinal !== undefined ||
 			options.milestone !== undefined ||
+			options.agent !== undefined ||
+			options.reviewAgent !== undefined ||
 			options.repo !== undefined ||
 			options.clearMilestone ||
 			options.plain ||
@@ -1470,7 +1474,10 @@ taskCmd
 	.option("--final-summary <text>", "add final summary")
 	.option("--ordinal <number>", "set task ordinal for custom ordering")
 	.option("-m, --milestone <milestone>", "assign task to milestone by ID or title")
-	.option("--agent <agent>", "assign the coder agent for the dispatch loop (alias from config `agents`, or a binary name)")
+	.option(
+		"--agent <agent>",
+		"assign the coder agent for the dispatch loop (alias from config `agents`, or a binary name)",
+	)
 	.option("--review-agent <agent>", "assign the reviewer agent (defaults to --agent when omitted)")
 	.option("--repo <path>", "target repository, as a path relative to the project root")
 	.option("--draft")
