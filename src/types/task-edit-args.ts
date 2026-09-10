@@ -41,6 +41,8 @@ export interface TaskEditArgs {
 	agent?: string;
 	/** Reviewer agent alias/binary. Pass an empty string to clear it. */
 	reviewAgent?: string;
+	/** Target repository, relative to the project root. Pass an empty string to clear it. */
+	repo?: string;
 }
 
 export type TaskEditRequest = TaskEditArgs & { id: string };

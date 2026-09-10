@@ -9,6 +9,10 @@ Independently audit the coder agent's work on the task whose ID is appended belo
 
 The Backlog.md MCP server is available — use it for every read and write of task state.
 
+## Where you are running
+
+Your working directory is already the repository under review. If the context block below names a **Repository**, the diff you are auditing lives there, and that is the only place to look for it — the backlog itself is in a hub above, reachable through the CLI and MCP as usual. If no Repository is named, this is a single-repo project and you are at its root.
+
 ## Workflow
 
 1. **Read the task** via MCP: title, description, acceptance criteria, definition of done, the coder's implementation notes, and any prior review notes.

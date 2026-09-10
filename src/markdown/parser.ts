@@ -194,6 +194,7 @@ export function parseTask(content: string): Task {
 		onStatusChange: frontmatter.onStatusChange ? String(frontmatter.onStatusChange) : undefined,
 		agent: frontmatter.agent ? String(frontmatter.agent) : undefined,
 		reviewAgent: frontmatter.reviewAgent ? String(frontmatter.reviewAgent) : undefined,
+		repo: frontmatter.repo ? String(frontmatter.repo) : undefined,
 	};
 }
 

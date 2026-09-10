@@ -15,6 +15,11 @@ export const taskListSchema: JsonSchema = {
 			type: "string",
 			maxLength: 100,
 		},
+		repo: {
+			type: "string",
+			maxLength: 200,
+			description: "Only list tasks targeting this repository (path relative to the project root).",
+		},
 		labels: {
 			type: "array",
 			items: { type: "string", maxLength: 50 },

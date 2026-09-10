@@ -56,6 +56,18 @@ export function generateAgentFieldSchema(config: BacklogConfig, role: "agent" | 
 }
 
 /**
+ * Schema for the `repo` task field, shared by task_create and task_edit.
+ * Free-text rather than an enum: nothing at this layer knows which
+ * repositories exist on disk, so the dispatcher is what validates the value.
+ */
+const REPO_FIELD_SCHEMA: JsonSchema = {
+	type: "string",
+	maxLength: 200,
+	description:
+		"Repository this task targets, as a path relative to the Backlog project root (for example payments-api, or platform/billing when nested). The dispatcher runs the agent with its working directory inside this repo. Omit it in single-repo projects, where work happens at the project root.",
+};
+
+/**
  * Generates the task_create input schema with dynamic status enum
  */
 export function generateTaskCreateSchema(config: BacklogConfig): JsonSchema {
@@ -165,6 +177,7 @@ export function generateTaskCreateSchema(config: BacklogConfig): JsonSchema {
 			},
 			agent: generateAgentFieldSchema(config, "agent"),
 			reviewAgent: generateAgentFieldSchema(config, "reviewAgent"),
+			repo: REPO_FIELD_SCHEMA,
 		},
 		required: ["title"],
 		additionalProperties: false,
@@ -414,6 +427,7 @@ export function generateTaskEditSchema(config: BacklogConfig): JsonSchema {
 			},
 			agent: generateAgentFieldSchema(config, "agent"),
 			reviewAgent: generateAgentFieldSchema(config, "reviewAgent"),
+			repo: REPO_FIELD_SCHEMA,
 		},
 		required: ["id"],
 		additionalProperties: false,

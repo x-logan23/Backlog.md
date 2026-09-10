@@ -103,6 +103,10 @@ export function formatTaskPlainText(task: Task, options: TaskPlainTextOptions = 
 		lines.push(`Milestone: ${task.milestone}`);
 	}
 
+	if (task.repo) {
+		lines.push(`Repo: ${task.repo}`);
+	}
+
 	if (task.parentTaskId) {
 		const parentLabel = task.parentTaskTitle ? `${task.parentTaskId} - ${task.parentTaskTitle}` : task.parentTaskId;
 		lines.push(`Parent: ${parentLabel}`);

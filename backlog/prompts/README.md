@@ -39,6 +39,40 @@ Nothing dispatches on `Blocked`: prompt selection falls through to a clean exit,
 Unlike `Testing`, `Blocked` ships by default: `Testing` strands every task entering it unless you supply a runner, whereas `Blocked` needs nothing behind it by design. It does have to be in `statuses:` for the dispatcher to move anything into it — and it must sit **before** `Done`, which has to stay last: the terminal status is defined as the final entry, and that is what the by-age cleanup archives.
 
 
+## Optional: one hub backlog across several repositories
+
+Default behaviour is unchanged and needs no setup: the agent runs at the project root, which in a normal single-repo project is the repository itself.
+
+A microservices codebase usually is not one repository, though. Running `backlog init` inside each service scatters task state across N repos and fragments the board, and every newly cloned service needs the setup repeated. Instead, put one backlog in the directory **above** the repos and give each task a `repo:` field:
+
+```
+~/code/                     <- backlog init "My Project" --no-git
+├── backlog/
+│   ├── config.yml
+│   ├── tasks/              <- every task, for every service
+│   └── prompts/            <- this directory
+├── payments-api/           <- ordinary git repos, untouched by Backlog.md
+├── auth-service/
+└── platform/billing/
+```
+
+```bash
+backlog task create "Fix retry backoff" --repo payments-api --plain
+backlog task list --repo payments-api --plain
+```
+
+The dispatcher then launches the agent **inside** `payments-api` rather than at the hub. The agent can still read and write task state from there: the CLI and the MCP server locate the project by walking *up* from the working directory and do not stop at a git boundary, so the hub stays reachable from inside any repo. Nothing is written into the service repos — no `backlog/` directory, no config, no `.gitignore` entry.
+
+`repo:` is a path relative to the project root, so `payments-api` and `platform/billing` both work. A task without one runs at the project root exactly as before.
+
+**When a repo cannot be used** — it does not exist, is not a directory, is not a git repository, or resolves outside the project root — the dispatcher launches nothing, appends the reason to the task's notes and moves it to `Blocked`. The last of those is a guard, not a formality: agents are launched with permissions skipped, so a task must never be able to point one at an arbitrary directory. Traversal (`../elsewhere`) and absolute paths are both rejected.
+
+Links are where the two dispatchers deliberately differ. `dispatch.sh` resolves them (`cd` + `pwd -P`) and judges the real destination, so a symlink pointing outside the project is rejected while one pointing inside is fine. `dispatch.ps1` targets PowerShell 5.1, which has no way to resolve a reparse point, and `GetFullPath` only collapses `..` as a string — so it **refuses to traverse a junction or symlink at all**, ancestors included. On Windows a junction needs neither admin rights nor Developer Mode, so refusing is the safe direction when the destination cannot be verified. If you want a Windows repo reachable through a link, give the real path instead.
+
+Unusable-repo rejection happens *before* the dedup and hop guards, so a typo never burns a hop claim — those count coder/reviewer disagreement, not misconfiguration.
+
+Two things the hub does not change: `create-mr.ps1` still takes a single `GITLAB_PROJECT_ID`, so per-repo merge requests need either the reviewer agent's own MCP step or a per-repo variant; and the opt-in `Testing` runner below is still invoked with the project root, not the task's repo.
+
 ## Optional: an automated test gate (`Testing`)
 
 Both dispatchers understand a `Testing` status between `In Progress` and `In Review`, so a suite runs on every branch before a reviewer ever looks at it. It is **opt-in and off by default**, because a `Testing` column with nothing behind it strands every task that enters it. To turn it on:

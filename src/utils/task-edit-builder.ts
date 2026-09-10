@@ -205,7 +205,7 @@ export function buildTaskUpdateInput(args: TaskEditArgs): TaskUpdateInput {
 		updateInput.uncheckDefinitionOfDone = [...args.definitionOfDoneUncheck];
 	}
 
-	// Pass agent/reviewAgent through when present; the core edit trims the value
+	// Pass agent/reviewAgent/repo through when present; the core edit trims the value
 	// and treats an empty string as "clear this field".
 	if (typeof args.agent === "string") {
 		updateInput.agent = args.agent;
@@ -213,6 +213,10 @@ export function buildTaskUpdateInput(args: TaskEditArgs): TaskUpdateInput {
 
 	if (typeof args.reviewAgent === "string") {
 		updateInput.reviewAgent = args.reviewAgent;
+	}
+
+	if (typeof args.repo === "string") {
+		updateInput.repo = args.repo;
 	}
 
 	return updateInput;

@@ -36,14 +36,12 @@ import {
 	resolveClosestMilestoneFilterValue,
 } from "../utils/milestone-filter.ts";
 import { buildIdRegex, extractAnyPrefix, getPrefixForType, normalizeId } from "../utils/prefix-config.ts";
+import { normalizeRepoValue } from "../utils/repo-filter.ts";
 import {
 	getCanonicalStatus as resolveCanonicalStatus,
 	getValidStatuses as resolveValidStatuses,
 } from "../utils/status.ts";
 import { executeStatusCallback } from "../utils/status-callback.ts";
-import { createTaskHookDispatcher, type TaskHookDispatcher } from "./task-hook-dispatcher.ts";
-import { createTaskWriteCoordinator, hashTaskContent, type TaskWriteCoordinator } from "./task-write-coordinator.ts";
-import { acquireWatcherLock, type WatcherLockHolder } from "./watcher-lock.ts";
 import {
 	buildDefinitionOfDoneItems,
 	normalizeDependencies,
@@ -61,6 +59,7 @@ import { migrateDraftPrefixes, needsDraftPrefixMigration } from "./prefix-migrat
 import { calculateNewOrdinal, DEFAULT_ORDINAL_STEP, resolveOrdinalConflicts } from "./reorder.ts";
 import { SearchService } from "./search-service.ts";
 import { computeSequences, planMoveToSequence, planMoveToUnsequenced } from "./sequences.ts";
+import { createTaskHookDispatcher, type TaskHookDispatcher } from "./task-hook-dispatcher.ts";
 import {
 	type BranchTaskStateEntry,
 	findTaskInLocalBranches,
@@ -70,6 +69,8 @@ import {
 	loadRemoteTasks,
 	resolveTaskConflict,
 } from "./task-loader.ts";
+import { createTaskWriteCoordinator, hashTaskContent, type TaskWriteCoordinator } from "./task-write-coordinator.ts";
+import { acquireWatcherLock, type WatcherLockHolder } from "./watcher-lock.ts";
 
 interface BlessedScreen {
 	program: {
@@ -431,6 +432,10 @@ export class Core {
 					normalizeMilestoneFilterValue(resolveMilestoneFilterValue?.(task.milestone ?? "") ?? task.milestone ?? "") ===
 					milestoneFilter,
 			);
+		}
+		if (filters.repo) {
+			const repoFilter = normalizeRepoValue(filters.repo);
+			result = result.filter((task) => normalizeRepoValue(task.repo ?? "") === repoFilter);
 		}
 		if (filters.parentTaskId) {
 			const parentFilter = filters.parentTaskId;
@@ -1243,10 +1248,10 @@ export class Core {
 				...(definitionOfDoneItems && definitionOfDoneItems.length > 0 && { definitionOfDoneItems }),
 				...(typeof input.onStatusChange === "string" &&
 					input.onStatusChange.trim().length > 0 && { onStatusChange: input.onStatusChange.trim() }),
-				...(typeof input.agent === "string" &&
-					input.agent.trim().length > 0 && { agent: input.agent.trim() }),
+				...(typeof input.agent === "string" && input.agent.trim().length > 0 && { agent: input.agent.trim() }),
 				...(typeof input.reviewAgent === "string" &&
 					input.reviewAgent.trim().length > 0 && { reviewAgent: input.reviewAgent.trim() }),
+				...(typeof input.repo === "string" && input.repo.trim().length > 0 && { repo: input.repo.trim() }),
 			};
 
 			const filePath = await this.writePreparedTask(task, isDraft);
@@ -1395,7 +1400,7 @@ export class Core {
 			}
 		}
 
-		for (const field of ["agent", "reviewAgent"] as const) {
+		for (const field of ["agent", "reviewAgent", "repo"] as const) {
 			if (input[field] !== undefined) {
 				const val = input[field] === null || input[field]?.trim().length === 0 ? undefined : input[field]?.trim();
 				if ((task[field] ?? undefined) !== val) {

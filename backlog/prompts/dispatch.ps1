@@ -13,6 +13,49 @@ $promptsDir = $scriptDir
 # fenced task in Blocked, and that runs long before agent dispatch.
 $projectRoot = (Resolve-Path (Join-Path $scriptDir '..\..') ).Path
 
+# ── Park a task in Blocked ───────────────────────────────────────────────────
+# Two callers need this: the loop guard fencing a task that will not converge,
+# and an unusable `repo:` further down. Both append a reason and move the task,
+# so it lives here once.
+#
+# Runs from the project root: the CLI locates the project by walking up from the
+# working directory, and the hook inherits whatever cwd the server that fired it
+# happened to have.
+#
+# Returns $true only when the task actually moved.
+function Move-TaskToBlocked {
+    param([string]$Note)
+
+    $parked = $false
+    $prevEap = $ErrorActionPreference
+    Push-Location $projectRoot
+    try {
+        # PowerShell 5.1 wraps a native command's stderr in an ErrorRecord and
+        # makes it TERMINATING while ErrorActionPreference is Stop -- for an exe
+        # that exited 0 and merely warned, too. That would abort the parking
+        # after the move had already succeeded. Judge these two calls by exit
+        # code alone.
+        #
+        # $LASTEXITCODE, not try/catch: a native executable returning non-zero
+        # does not raise in PowerShell, so a catch block alone would report
+        # success for a task that never moved -- the one outcome that must not
+        # be reported wrongly, since nothing else is watching.
+        $ErrorActionPreference = 'Continue'
+        # --append-notes, never --notes: the latter REPLACES the notes section,
+        # deleting whatever record the coder and reviewer already wrote.
+        & backlog task edit $env:TASK_ID --append-notes $Note 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Host "dispatch.ps1: could not append the reason to $env:TASK_ID (exit $LASTEXITCODE)." }
+        & backlog task edit $env:TASK_ID -s Blocked 2>&1 | Out-Null
+        $parked = ($LASTEXITCODE -eq 0)
+    } catch {
+        Write-Host "dispatch.ps1: parking $env:TASK_ID in Blocked failed ($($_.Exception.Message))."
+    } finally {
+        $ErrorActionPreference = $prevEap
+        Pop-Location
+    }
+    return $parked
+}
+
 # ── Force subscription auth for dispatched agents ────────────────────────────
 # If the project it manages also uses the Anthropic API, its ANTHROPIC_API_KEY
 # tends to reach this process's environment (a repo-root .env, a compose file, or
@@ -177,13 +220,142 @@ if (-not (Test-Path $promptFile)) {
     exit 0
 }
 
+# ── Task file lookup ─────────────────────────────────────────────────────────
+# Resolved once, here, and reused by the repo resolution below, the agent and
+# session-id resolution, and the token report.
+#
+# Matched on an anchored "<id> - *.md" pattern rather than a bare substring:
+# `*BACK-1*` also matches back-12 and back-166, and picking a neighbouring
+# task's frontmatter was tolerable when it only chose an agent name, but not
+# when it decides which repository an agent with skipped permissions is turned
+# loose in. The loose match stays as a fallback so no existing project's naming
+# stops resolving.
+$tasksDir = Join-Path $projectRoot 'backlog\tasks'
+$taskFile = Get-ChildItem $tasksDir -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ilike "$env:TASK_ID - *.md" } |
+    Select-Object -First 1
+if (-not $taskFile) {
+    $taskFile = Get-ChildItem $tasksDir -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ilike "*$env:TASK_ID*" } |
+        Select-Object -First 1
+}
+
+# ── Target repository resolution ─────────────────────────────────────────────
+# A task may name the repository it targets (frontmatter `repo:`), so a single
+# hub backlog can drive work across sibling repositories. The value is a path
+# relative to the project root.
+#
+# No `repo:` is the normal, single-repo case: the agent runs at the project
+# root exactly as it always has.
+#
+# Deliberately side-effect free, and placed before the dry-run gate and before
+# the dedup and hop guards -- a misconfigured repo must not burn a hop claim,
+# which counts coder/reviewer disagreement, not typos.
+$taskFileContent = ''
+if ($taskFile) {
+    $taskFileContent = Get-Content $taskFile.FullName -Raw
+    # Confirm the file actually is this task before anything trusts its `repo:`.
+    # The fallback lookup above is a substring match, so BACK-1 can still select
+    # BACK-12's file when a project uses a filename the anchored pattern does not
+    # fit. The frontmatter id is the authority, and it is free to check because
+    # the file is read either way. A file carrying no `id:` at all is left alone
+    # rather than rejected, so an unusual-but-valid project keeps dispatching.
+    if ($taskFileContent -match '(?m)^id:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
+        $foundId = $matches[1].Trim()
+        if ($foundId -ne $env:TASK_ID) {
+            Write-Host "dispatch.ps1: ignoring $($taskFile.Name) - its id ($foundId) is not $env:TASK_ID."
+            $taskFile = $null
+            $taskFileContent = ''
+        }
+    }
+}
+
+$taskRepo = ''
+if ($taskFileContent -and $taskFileContent -match '(?m)^repo:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
+    $taskRepo = $matches[1].Trim()
+}
+
+$agentWorkDir = $projectRoot
+$repoError = ''
+if ($taskRepo) {
+    if ([System.IO.Path]::IsPathRooted($taskRepo) -or $taskRepo.StartsWith('~')) {
+        $repoError = 'absolute paths are not allowed; use a path relative to the project root'
+    } else {
+        # GetFullPath normalizes any ".." segments, so the containment check
+        # below sees the real destination rather than the string written down.
+        #
+        # It is a pure string operation, though: it does NOT follow reparse
+        # points, so a junction inside the project root pointing outside it
+        # would pass the prefix test below and hand an agent a working
+        # directory outside the project. dispatch.sh does not have this hole,
+        # because `cd` + `pwd -P` resolves links before the check.
+        #
+        # PowerShell 5.1 has no ResolveLinkTarget, so rather than resolve, we
+        # REFUSE to traverse a reparse point at all -- see the walk below.
+        $projectRootFull = [System.IO.Path]::GetFullPath($projectRoot)
+        $candidate = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $taskRepo))
+        $sep = [System.IO.Path]::DirectorySeparatorChar
+        $rootPrefix = $projectRootFull.TrimEnd($sep) + $sep
+
+        # Walk the candidate and every ancestor down to the project root. The
+        # leaf alone is not enough: `repo: link/inner` hides the junction in an
+        # ancestor, and only the leaf would look ordinary.
+        $crossesLink = $false
+        $rootTrimmed = $projectRootFull.TrimEnd($sep)
+        $probe = $candidate.TrimEnd($sep)
+        while ($probe.Length -gt $rootTrimmed.Length) {
+            if (Test-Path -LiteralPath $probe) {
+                $attrs = (Get-Item -LiteralPath $probe -Force).Attributes
+                if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $crossesLink = $true; break }
+            }
+            $parent = [System.IO.Path]::GetDirectoryName($probe)
+            if (-not $parent -or $parent -eq $probe) { break }
+            $probe = $parent.TrimEnd($sep)
+        }
+
+        if (-not $candidate.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            # An agent launches with permissions skipped, so a task must never
+            # be able to point one at somewhere outside the project.
+            $repoError = "resolves outside the project root ($candidate)"
+        } elseif ($crossesLink) {
+            # Stricter than the POSIX dispatcher, which can resolve the link and
+            # accept one that stays inside the project. Refusing is the safe
+            # direction when the destination cannot be verified.
+            $repoError = "path crosses a junction or symlink, whose target cannot be verified on PowerShell 5.1"
+        } elseif (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            $repoError = "no such directory: $candidate"
+        } elseif (-not (Test-Path -LiteralPath (Join-Path $candidate '.git'))) {
+            # `.git` is a file, not a directory, in worktrees and submodules,
+            # so this deliberately does not pass -PathType.
+            $repoError = "not a git repository (no .git in $candidate)"
+        } else {
+            $agentWorkDir = $candidate
+        }
+    }
+}
+
+if ($repoError) {
+    Write-Host "dispatch.ps1: $env:TASK_ID has repo '$taskRepo' which cannot be used: $repoError"
+} elseif ($taskRepo) {
+    Write-Host "dispatch.ps1: workdir=$agentWorkDir (repo: $taskRepo)"
+} else {
+    Write-Host "dispatch.ps1: workdir=$agentWorkDir"
+}
+
+# The repository line is only appended when the task names one, so a
+# single-repo project gets exactly the context block it always got.
+$repoContext = ''
+if ($taskRepo -and -not $repoError) {
+    $repoContext = "`nRepository: $taskRepo (you are already running inside it: $agentWorkDir)"
+}
+
 $promptBody = Get-Content -Path $promptFile -Raw
 $fullPrompt = @"
 $promptBody
 
 ---
 Task: $env:TASK_ID -- $env:TASK_TITLE
-Status: $env:OLD_STATUS -> $env:NEW_STATUS
+Status: $env:OLD_STATUS -> $env:NEW_STATUS$repoContext
 "@
 
 # ── Log file ─────────────────────────────────────────────────────────────────
@@ -196,7 +368,32 @@ $logFile = Join-Path $logDir "$timestamp-$PID-$safeTaskId-$safeStatus.log"
 $promptPath = "$logFile.prompt"
 [System.IO.File]::WriteAllText($promptPath, $fullPrompt, (New-Object System.Text.UTF8Encoding $false))
 
+# Sits after repo resolution (which is side-effect free) so the resolved working
+# directory and any rejection reason are both observable without launching
+# anything or touching task state.
 if ($env:BACKLOG_DISPATCH_DRY_RUN -eq '1') { exit 0 }
+
+# ── Unusable repo: park the task instead of dispatching ──────────────────────
+# Same treatment the loop guard gives a fenced task, and for the same reason:
+# refusing to dispatch while leaving the task where it was makes it look healthy
+# on the board, with the only trace a log line nobody reads. A task pointing at
+# a repo that does not exist needs a person, so it goes in front of one.
+if ($repoError) {
+    $repoNote = @"
+Dispatch blocked: the task targets repo '$taskRepo', which cannot be used.
+Reason: $repoError
+Transition: $env:OLD_STATUS -> $env:NEW_STATUS. Log: $logFile
+
+Set a valid repo (a path relative to the project root, e.g. payments-api), or
+clear the field to run at the project root, then move this task out of Blocked.
+"@
+    if (Move-TaskToBlocked -Note $repoNote) {
+        Write-Host "dispatch.ps1: $env:TASK_ID moved to Blocked - unusable repo."
+    } else {
+        Write-Host "dispatch.ps1: $env:TASK_ID stays in $env:NEW_STATUS - no Blocked status configured, or the CLI is unavailable."
+    }
+    exit 0
+}
 
 # ── Deduplication guard ───────────────────────────────────────────────────────
 # The onStatusChange hook can fire more than once for the same event when the
@@ -330,37 +527,7 @@ The agents were not misbehaving -- they simply kept disagreeing. A human needs t
 re-scope, split, reassign, or accept it. Moving this task out of Blocked clears
 the hop claims and the loop starts over.
 "@
-            # Run from the project root: the CLI locates the project by walking
-            # up from the working directory, and the hook inherits whatever cwd
-            # the server that fired it happened to have.
-            #
-            # $LASTEXITCODE, not try/catch: a native executable returning non-zero
-            # does not raise in PowerShell, so a catch block alone would report
-            # success for a task that never moved -- which is the one outcome that
-            # must not be reported wrongly, since nothing else is watching.
-            $parked = $false
-            $prevEap = $ErrorActionPreference
-            Push-Location $projectRoot
-            try {
-                # PowerShell 5.1 wraps a native command's stderr in an ErrorRecord
-                # and makes it TERMINATING while ErrorActionPreference is Stop --
-                # for an exe that exited 0 and merely warned, too. That would abort
-                # the parking after the move had already succeeded. Judge these two
-                # calls by exit code alone.
-                $ErrorActionPreference = 'Continue'
-                # --append-notes, never --notes: the latter REPLACES the notes
-                # section, which would delete the coder's and reviewer's record of
-                # the six rounds that are the whole reason this is being fenced.
-                & backlog task edit $env:TASK_ID --append-notes $blockedNote 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) { Write-Host "dispatch.ps1: could not append the block reason to $env:TASK_ID (exit $LASTEXITCODE)." }
-                & backlog task edit $env:TASK_ID -s Blocked 2>&1 | Out-Null
-                $parked = ($LASTEXITCODE -eq 0)
-            } catch {
-                Write-Host "dispatch.ps1: parking $env:TASK_ID in Blocked failed ($($_.Exception.Message))."
-            } finally {
-                $ErrorActionPreference = $prevEap
-                Pop-Location
-            }
+            $parked = Move-TaskToBlocked -Note $blockedNote
 
             if ($parked) {
                 Write-Host "dispatch.ps1: $env:TASK_ID moved to Blocked for a human decision."
@@ -423,7 +590,7 @@ try {
 # Tasks without `agent:` in frontmatter are human tasks -- skip dispatch.
 # Exception: Human Review always fires the notifier (ready.md).
 
-$tasksDir = Join-Path $projectRoot 'backlog\tasks'
+# $tasksDir and $taskFile were resolved once, up with the repo resolution.
 
 # ── Alias → binary resolution ─────────────────────────────────────────────────
 # Read the agents: block from backlog/config.yml. If the task's agent value
@@ -461,16 +628,13 @@ if (Test-Path $configFile) {
         }
     }
 }
-$taskFile = Get-ChildItem $tasksDir -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ilike "*$env:TASK_ID*" } |
-    Select-Object -First 1
-
 $taskAgentName = ''
 $taskReviewAgentName = ''
 $coderSessionId = ''
 $reviewerSessionId = ''
 if ($taskFile) {
-    $taskContent = Get-Content $taskFile.FullName -Raw
+    # Already read once for the repo field; reuse it rather than hitting disk again.
+    $taskContent = $taskFileContent
     if ($taskContent -match '(?m)^agent:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
         $taskAgentName = $matches[1].Trim()
     }
@@ -747,7 +911,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     } elseif ($agentBinary.ToLower() -eq 'opencode') {
         $agentArgs = @('run', '--dangerously-skip-permissions', '-s', $coderSessionId, '-f', $reworkPath, '--', 'Read and follow the attached instructions.')
         Start-Process `
@@ -756,7 +920,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     } else {
         $agentArgs = @('--resume', $coderSessionId, '--dangerously-skip-permissions') + $claudeModelArgs + $claudeMcpArgs
         Start-Process `
@@ -766,7 +930,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     }
 } elseif ($isReviewerResume) {
     $reviewResumeMessage = "The coder has addressed the findings on task $env:TASK_ID. Re-read the task via the Backlog.md MCP (task_view), verify every fix, and run the tests. If anything still fails, request more changes (set status In Progress). If everything passes, you MUST complete the FULL approval routing from review.md Step 6 before finishing. Do NOT just move the status. In order: (1) check the satisfied acceptance criteria, (2) ensure the implementation branch is pushed to origin, (3) create the GitLab Merge Request into main via the gitlab MCP create_merge_request with dry_run set to false, using the implementation branch recorded in the task notes as source_branch and NOT the git current branch, then (4) set status to Human Review. If you cannot create the MR, append a clearly-flagged note that the MR was NOT created and still proceed. Never skip the MR step silently."
@@ -782,7 +946,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     } elseif ($agentBinary.ToLower() -eq 'opencode') {
         $agentArgs = @('run', '--dangerously-skip-permissions', '-s', $reviewerSessionId, '-f', $reviewResumePath, '--', 'Read and follow the attached instructions.')
         Start-Process `
@@ -791,7 +955,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     } else {
         $agentArgs = @('--resume', $reviewerSessionId, '--dangerously-skip-permissions') + $claudeModelArgs + $claudeMcpArgs
         Start-Process `
@@ -801,7 +965,7 @@ if ($isCoderRework) {
             -RedirectStandardOutput $logFile `
             -RedirectStandardError "$logFile.err" `
             -WindowStyle Hidden `
-            -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+            -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
     }
 } elseif ($agentBinary.ToLower() -eq 'codex') {
     # First run: codex exec reads the prompt from stdin via `-`.
@@ -816,7 +980,7 @@ if ($isCoderRework) {
         -RedirectStandardOutput $logFile `
         -RedirectStandardError "$logFile.err" `
         -WindowStyle Hidden `
-        -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+        -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
 } elseif ($agentBinary.ToLower() -eq 'opencode') {
     # opencode run: attach the prompt file with -f.
     # The message positional must come AFTER -- to prevent opencode from
@@ -828,7 +992,7 @@ if ($isCoderRework) {
         -RedirectStandardOutput $logFile `
         -RedirectStandardError "$logFile.err" `
         -WindowStyle Hidden `
-        -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+        -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
 } else {
     # Claude: new session, prompt via stdin.
     $agentArgs = @('-p', '--dangerously-skip-permissions') + $claudeModelArgs + $claudeMcpArgs
@@ -839,7 +1003,7 @@ if ($isCoderRework) {
         -RedirectStandardOutput $logFile `
         -RedirectStandardError "$logFile.err" `
         -WindowStyle Hidden `
-        -WorkingDirectory $projectRoot -PassThru | ForEach-Object { $script:agentProc = $_ }
+        -WorkingDirectory $agentWorkDir -PassThru | ForEach-Object { $script:agentProc = $_ }
 }
 
 # Write the launched agent's PID so the web UI can check whether the process is

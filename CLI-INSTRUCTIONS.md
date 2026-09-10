@@ -49,13 +49,16 @@ You can rerun the wizard anytime with `backlog config`. All existing CLI flags (
 | Create with refs | `backlog task create "Feature" --ref https://docs.example.com --ref src/api.ts` |
 | Create with docs | `backlog task create "Feature" --doc https://design-docs.example.com --doc docs/spec.md` |
 | Create with agents | `backlog task create "Feature" --agent claude --review-agent codex` |
+| Create for a repo | `backlog task create "Feature" --repo payments-api` (multi-repo hubs only; omit it in single-repo projects) |
 | Create sub task | `backlog task create -p 14 "Add Login with Google"`|
 | Create (all options) | `backlog task create "Feature" -d "Description" -a @sara -s "To Do" -l auth --priority high --ac "Must work" --notes "Initial setup done" --dep task-1 --ref src/api.ts --doc docs/spec.md -p 14` |
 | List tasks  | `backlog task list [-s <status>] [-a <assignee>] [-p <parent>]` |
 | List by parent | `backlog task list --parent 42` or `backlog task list -p task-42` |
+| List by repo | `backlog task list --repo payments-api` |
 | View detail | `backlog task 7` (interactive UI, press 'E' to edit in editor) |
 | View (AI mode) | `backlog task 7 --plain`                           |
 | Edit        | `backlog task edit 7 -a @sara -l auth,backend`       |
+| Set repo    | `backlog task edit 7 --repo payments-api` (pass `--repo ""` to clear it) |
 | Add plan    | `backlog task edit 7 --plan "Implementation approach"`    |
 | Set agents  | `backlog task edit 7 --agent claude --review-agent codex` |
 | Clear an agent | `backlog task edit 7 --review-agent ""` (empty string clears) |

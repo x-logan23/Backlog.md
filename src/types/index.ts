@@ -63,6 +63,18 @@ export interface Task {
 	agent?: string;
 	/** Agent CLI to use when this task moves to "In Review". Falls back to `agent` when absent, then to global dispatch default. */
 	reviewAgent?: string;
+	/**
+	 * Repository this task targets, as a path relative to the Backlog project
+	 * root (e.g. "payments-api", or "platform/billing" when nested). Lets one
+	 * hub backlog drive work across sibling repositories: the dispatcher runs
+	 * the agent with its working directory inside the resolved repo instead of
+	 * the project root. Absent means the project root itself, which is the
+	 * single-repo behavior.
+	 *
+	 * Stored verbatim. Resolution and validation belong to the dispatcher,
+	 * which is the only thing that acts on the value.
+	 */
+	repo?: string;
 }
 
 export interface MilestoneBucket {
@@ -117,6 +129,8 @@ export interface TaskCreateInput {
 	agent?: string;
 	/** Agent CLI to invoke as the reviewer. Defaults to `agent` when absent. */
 	reviewAgent?: string;
+	/** Target repository, as a path relative to the project root. See {@link Task.repo}. */
+	repo?: string;
 }
 
 export interface TaskUpdateInput {
@@ -165,6 +179,8 @@ export interface TaskUpdateInput {
 	agent?: string | null;
 	/** Agent CLI to invoke as the reviewer. Pass `null` or empty to clear. */
 	reviewAgent?: string | null;
+	/** Target repository, as a path relative to the project root. Pass `null` or empty to clear. See {@link Task.repo}. */
+	repo?: string | null;
 }
 
 export interface TaskListFilter {
@@ -172,6 +188,7 @@ export interface TaskListFilter {
 	assignee?: string;
 	priority?: "high" | "medium" | "low";
 	milestone?: string;
+	repo?: string;
 	parentTaskId?: string;
 	labels?: string[];
 }
@@ -322,14 +339,24 @@ export interface BoardColumnConfig {
  * is intentionally closed — adding a new option later is a code change,
  * not user config. The order here is documentation only; the actual
  * render order is pinned inside TaskCard.tsx (header-left → header-right
- * → body-milestone → body-labels → footer-left → footer-right) and the
- * UI exposes visibility toggles, not reordering.
+ * → body-repo → body-milestone → body-agent → body-labels → footer-left
+ * → footer-right) and the UI exposes visibility toggles, not reordering.
  *
  * Always-on card chrome (title, cross-branch banner/tooltip, priority
  * border accent, drag-state visuals) is rendered unconditionally and is
  * NOT part of this enum — those elements aren't user-configurable.
  */
-export const CONFIGURABLE_CARD_FIELDS = ["id", "priority", "milestone", "labels", "createdDate", "assignee", "agent", "reviewAgent"] as const;
+export const CONFIGURABLE_CARD_FIELDS = [
+	"id",
+	"priority",
+	"repo",
+	"milestone",
+	"labels",
+	"createdDate",
+	"assignee",
+	"agent",
+	"reviewAgent",
+] as const;
 export type ConfigurableCardField = (typeof CONFIGURABLE_CARD_FIELDS)[number];
 
 export interface CardConfig {
