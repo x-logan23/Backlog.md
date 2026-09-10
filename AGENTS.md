@@ -100,3 +100,22 @@ are found, the commit will be blocked until fixed.
 - **Committing**: Use the following format: `BACK-123 - Title of the task`
 - **PR titles**: Use `{taskId} - {taskTitle}` (e.g. `BACK-123 - Title of the task`)
 - **Github CLI**: Use `gh` whenever possible for PRs and issues
+- **Never push directly to `main`.** Every change reaches `main` through a pull
+  request, including one-line fixes and docs-only edits. `git merge` on a local
+  `main` followed by `git push` produces exactly the same commits, so it looks
+  equivalent and is easy to reach for -- but GitHub never sees a PR, and the work
+  leaves no review trail, no discussion thread, and nothing to link a task to. It
+  also cannot be fixed afterwards: once the branch is an ancestor of `main`,
+  GitHub refuses to open a PR for it ("no commits between..."), so the only
+  remedy is reverting shared history. Ask before merging if a PR is genuinely
+  impractical; do not decide unilaterally.
+
+The whole flow:
+
+```bash
+git switch -c tasks/back-123-short-name
+# ... work, commit ...
+git push -u origin tasks/back-123-short-name
+gh pr create --title "BACK-123 - Title of the task" --body "..."
+gh pr merge --merge --delete-branch
+```
