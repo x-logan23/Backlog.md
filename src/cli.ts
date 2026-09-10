@@ -3421,6 +3421,14 @@ configCmd
 
 			// Handle specific config keys
 			switch (key) {
+				case "theme":
+					if (config.theme) {
+						console.log(config.theme);
+					} else {
+						console.log("theme is not set (using the default look)");
+						process.exit(1);
+					}
+					break;
 				case "defaultEditor":
 					if (config.defaultEditor) {
 						console.log(config.defaultEditor);
@@ -3485,7 +3493,7 @@ configCmd
 				default:
 					console.error(`Unknown config key: ${key}`);
 					console.error(
-						"Available keys: defaultEditor, projectName, defaultStatus, statuses, labels, milestones, definitionOfDone, dateFormat, maxColumnWidth, defaultPort, autoOpenBrowser, remoteOperations, autoCommit, filesystemOnly, bypassGitHooks, zeroPaddedIds, checkActiveBranches, activeBranchDays",
+						"Available keys: defaultEditor, projectName, defaultStatus, statuses, labels, milestones, definitionOfDone, dateFormat, maxColumnWidth, defaultPort, autoOpenBrowser, remoteOperations, autoCommit, filesystemOnly, bypassGitHooks, zeroPaddedIds, checkActiveBranches, activeBranchDays, theme",
 					);
 					process.exit(1);
 			}
@@ -3511,6 +3519,28 @@ configCmd
 
 			// Handle specific config keys
 			switch (key) {
+				case "theme": {
+					const themeName = value.trim();
+					if (!themeName) {
+						// Empty clears the override and restores the default look.
+						config.theme = undefined;
+						break;
+					}
+					if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(themeName)) {
+						console.error(`Invalid theme name: ${themeName}`);
+						console.error("Use only letters, digits, dot, dash and underscore — it names a file, not a path.");
+						process.exit(1);
+					}
+					// Missing file is a warning, not an error: setting the name
+					// before writing the stylesheet is a reasonable order to
+					// work in, and the server falls back to the default look.
+					const themePath = join(core.filesystem.backlogDir, "themes", `${themeName}.css`);
+					if (!(await Bun.file(themePath).exists())) {
+						console.warn(`Note: ${themePath} does not exist yet — the default look is used until you create it.`);
+					}
+					config.theme = themeName;
+					break;
+				}
 				case "defaultEditor": {
 					// Validate that the editor command exists
 					const { isEditorAvailable } = await import("./utils/editor.ts");
@@ -3676,7 +3706,7 @@ configCmd
 				default:
 					console.error(`Unknown config key: ${key}`);
 					console.error(
-						"Available keys: defaultEditor, projectName, defaultStatus, dateFormat, maxColumnWidth, autoOpenBrowser, defaultPort, remoteOperations, autoCommit, filesystemOnly, bypassGitHooks, zeroPaddedIds, checkActiveBranches, activeBranchDays",
+						"Available keys: defaultEditor, projectName, defaultStatus, dateFormat, maxColumnWidth, autoOpenBrowser, defaultPort, remoteOperations, autoCommit, filesystemOnly, bypassGitHooks, zeroPaddedIds, checkActiveBranches, activeBranchDays, theme",
 					);
 					process.exit(1);
 			}
@@ -3724,6 +3754,7 @@ configCmd
 			console.log(`  taskPrefix: ${config.prefixes?.task || "task"} (read-only)`);
 			console.log(`  checkActiveBranches: ${config.checkActiveBranches ?? "true"}`);
 			console.log(`  activeBranchDays: ${config.activeBranchDays ?? "30"}`);
+			console.log(`  theme: ${config.theme || "(default)"}`);
 		} catch (err) {
 			console.error("Failed to list config values", err);
 			process.exitCode = 1;

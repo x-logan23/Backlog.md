@@ -432,6 +432,17 @@ export interface BacklogConfig {
 	 */
 	board?: BoardConfig;
 	/**
+	 * Optional web UI theme. Names a CSS file at
+	 * `<backlogDir>/themes/<theme>.css` whose custom-property overrides are
+	 * layered over the bundled stylesheet at runtime, so switching or editing a
+	 * theme needs no rebuild.
+	 *
+	 * Absent (the default) means the built-in look: no extra stylesheet, no
+	 * overrides. Light/dark remains a separate per-viewer choice that a theme
+	 * can target via `:root` and `.dark`.
+	 */
+	theme?: string;
+	/**
 	 * Named agents available in this project. When configured, the UI shows
 	 * a dropdown instead of a free-text input for the `agent` and
 	 * `reviewAgent` task fields. The dispatcher resolves each alias to its

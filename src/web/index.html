@@ -88,6 +88,31 @@
         })();
     </script>
     <script>
+        // Load the project's theme stylesheet, if one is configured.
+        //
+        // Injected here rather than written as a static <link> because the
+        // bundler resolves markup hrefs at build time and cannot resolve a
+        // route that only exists at runtime.
+        //
+        // This link ends up BEFORE the bundled stylesheet, which the bundler
+        // appends to the end of <head> — and that is fine, despite looking
+        // backwards. Tailwind v4 emits its entire output inside cascade
+        // layers (properties, theme, base, components, utilities), including
+        // the --color-* palette in `@layer theme`, and unlayered declarations
+        // beat layered ones no matter the source order. A theme file must
+        // therefore stay unlayered: wrapping it in `@layer` would hand
+        // precedence back to the defaults.
+        //
+        // The route always answers with CSS (empty when no theme is set), so
+        // an unthemed project costs one 200 and nothing else.
+        (function() {
+            var link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = '/theme.css';
+            document.head.appendChild(link);
+        })();
+    </script>
+    <script>
         // Prevent flash of wrong theme by applying theme before page renders
         (function() {
             const savedTheme = localStorage.getItem('backlog-theme');
