@@ -1452,6 +1452,9 @@ ${description || `Milestone: ${title}`}`,
 				case "shell":
 					config.shell = value.replace(/^['"]|['"]$/g, "");
 					break;
+				case "theme":
+					config.theme = value.replace(/^['"]|['"]$/g, "");
+					break;
 				case "task_prefix":
 					config.prefixes = { task: value.replace(/['"]/g, "") };
 					break;
@@ -1484,6 +1487,7 @@ ${description || `Milestone: ${title}`}`,
 			activeBranchDays: config.activeBranchDays,
 			onStatusChange: config.onStatusChange,
 			shell: config.shell,
+			theme: config.theme,
 			prefixes: config.prefixes,
 			backlogDirectory: config.backlogDirectory,
 			board: parsedBoard,
@@ -1648,6 +1652,7 @@ ${description || `Milestone: ${title}`}`,
 			...(typeof config.activeBranchDays === "number" ? [`active_branch_days: ${config.activeBranchDays}`] : []),
 			...(config.onStatusChange ? [`onStatusChange: '${config.onStatusChange}'`] : []),
 			...(config.shell ? [`shell: "${config.shell}"`] : []),
+			...(config.theme ? [`theme: "${config.theme}"`] : []),
 			...(config.prefixes?.task ? [`task_prefix: "${config.prefixes.task}"`] : []),
 			...(config.backlogDirectory ? [`backlog_directory: "${config.backlogDirectory}"`] : []),
 			...this.serializeBoardBlock(config.board),

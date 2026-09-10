@@ -37,6 +37,7 @@ Running `backlog config` with no arguments launches the interactive advanced wiz
 | `activeBranchDays` | How many days a branch is considered active | `30` |
 | `onStatusChange`  | Shell command to run on status change | `(disabled)` |
 | `shell`           | Shell used to execute `onStatusChange` (`auto`, `sh`, `bash`, `cmd`, `pwsh`, `powershell`, or absolute path) | `auto` |
+| `theme`           | Web UI theme; names `<backlogDir>/themes/<theme>.css` | `(default look)` |
 
 ## Detailed Notes
 
@@ -55,3 +56,47 @@ Running `backlog config` with no arguments launches the interactive advanced wiz
 > **Shell selection (cross-platform)**: The optional `shell` config picks the interpreter used to run `onStatusChange`. Default `auto` uses `sh` on POSIX and prefers `sh.exe` on Windows (falling back to `cmd.exe` with a warning if Git for Windows isn't installed). Override with `sh`, `bash`, `cmd`, `pwsh`, `powershell`, or an absolute path to any interpreter (treated as POSIX-style `-c`). Note: variables are always passed as environment variables, so on `cmd` use `%TASK_ID%` and on PowerShell use `$env:TASK_ID` instead of `$TASK_ID`.
 
 > **Date/Time Support**: Backlog.md now supports datetime precision for all dates. New items automatically include time (YYYY-MM-DD HH:mm format in UTC), while existing date-only entries remain unchanged for backward compatibility. Use the migration script `bun src/scripts/migrate-dates.ts` to optionally add time to existing items.
+
+## Theming the web UI
+
+The browser interface ships with one look, and `theme` replaces its colors without touching any component or rebuilding anything.
+
+```bash
+backlog config set theme bankaya     # loads backlog/themes/bankaya.css
+backlog config set theme ""          # back to the default look
+```
+
+Every Tailwind utility in the UI compiles to a CSS custom property — `.bg-gray-50` is `background-color: var(--color-gray-50)` — and the whole palette is declared on `:root`. A theme is therefore just a stylesheet that redefines the variables it cares about; everything referencing them re-colors at once.
+
+Create `backlog/themes/<name>.css`:
+
+```css
+/* backlog/themes/bankaya.css */
+:root {
+  /* Brand primary. Used by buttons, links, focus rings and the active nav item. */
+  --color-blue-600: #0a3d62;
+  --color-blue-700: #082f4b;
+
+  /* Page and surface neutrals. */
+  --color-gray-50: #f7f9fb;
+  --color-gray-100: #eef2f6;
+}
+
+/* Dark mode is a separate per-viewer toggle; target it with .dark. */
+.dark {
+  --color-gray-800: #101820;
+  --color-gray-900: #0a1014;
+}
+```
+
+Notes:
+
+- **The file is read per request**, so editing a palette only needs a page reload — no `bun run build`, no server restart.
+- **Only the variables you set change.** Anything you leave out keeps its default, so a theme can be three lines or three hundred.
+- **`theme` unset is the default look** — no stylesheet is fetched beyond an empty response, and the UI renders exactly as it always has.
+- **Light and dark are orthogonal.** The theme is project-wide config; light/dark stays a per-viewer choice in the UI. Put shared values on `:root` and mode-specific ones under `.dark`.
+- **Names are filenames, not paths.** Letters, digits, dot, dash and underscore only; a name that could point outside `themes/` is ignored and the default look is used.
+- **Keep the theme file unlayered.** Tailwind emits its own output inside cascade layers, and unlayered CSS beats layered CSS regardless of load order — which is exactly what lets a theme win. Wrapping your rules in `@layer` would hand precedence back to the defaults and silently do nothing.
+- **A missing or broken theme never breaks the board** — it falls back to the default and logs a warning on the server.
+
+To find the variable behind a color, inspect the element in your browser: the computed style shows the `var(--color-…)` the utility resolves to.

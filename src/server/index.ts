@@ -427,6 +427,10 @@ export class BacklogServer {
 					"/api/tasks/:id/complete": {
 						POST: async (req: Request & { params: { id: string } }) => await this.handleCompleteTask(req.params.id),
 					},
+					"/theme.css": {
+						GET: async () => await this.handleThemeCss(),
+					},
+
 					"/api/statuses": {
 						GET: async () => await this.handleGetStatuses(),
 					},
@@ -1624,6 +1628,52 @@ export class BacklogServer {
 		} catch (error) {
 			console.error("Error getting version:", error);
 			return Response.json({ error: "Failed to get version" }, { status: 500 });
+		}
+	}
+
+	/**
+	 * Serves the project's active theme: the CSS file named by `theme:` in
+	 * config, from `<backlogDir>/themes/<name>.css`.
+	 *
+	 * The page always requests this, so every outcome returns 200 with CSS —
+	 * an empty body when no theme is configured (the default look) or when the
+	 * named file is missing. A 404 here would put a console error on every
+	 * page load of an unthemed project, which is the normal case.
+	 *
+	 * Read per request rather than cached: it is one small file, and it means
+	 * editing a palette only needs a page reload.
+	 */
+	private async handleThemeCss(): Promise<Response> {
+		const headers = new Headers({ "Content-Type": "text/css; charset=utf-8" });
+		applyNoStoreHeaders(headers);
+		const empty = () => new Response("", { headers });
+
+		try {
+			const config = await this.core.filesystem.loadConfig();
+			const name = config?.theme?.trim();
+			if (!name) return empty();
+
+			// No path separators are accepted, so a config value cannot reach
+			// outside the themes directory. `.css` is appended rather than
+			// taken from the config, so the value can only ever name a
+			// stylesheet.
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+				console.warn(`Ignoring theme "${name}": names may contain only letters, digits, dot, dash and underscore.`);
+				return empty();
+			}
+
+			const themePath = join(this.core.filesystem.backlogDir, "themes", `${name}.css`);
+			const file = Bun.file(themePath);
+			if (!(await file.exists())) {
+				console.warn(`Theme "${name}" is configured but ${themePath} does not exist; using the default look.`);
+				return empty();
+			}
+
+			return new Response(await file.text(), { headers });
+		} catch (error) {
+			// A broken theme must never take the board down with it.
+			console.error("Error loading theme:", error);
+			return empty();
 		}
 	}
 
