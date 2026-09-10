@@ -9,8 +9,8 @@ import {
 	claudeProjectSlug,
 	deriveBadgeState,
 	extractSessionIds,
-	feedKindForBinary,
 	type FeedKind,
+	feedKindForBinary,
 	hopCount,
 	isLikelyRunning,
 	parseLogStem,
@@ -62,9 +62,10 @@ function agentLogParse(raw: string, isHumanReadable: boolean): string {
 					out.push("");
 				} else if (item.type === "command_execution") {
 					// Strip the long powershell.exe path prefix for readability.
-					const cmd = typeof item.command === "string"
-						? item.command.replace(/^"[^"]*powershell[^"]*"\s+-\w+\s+/i, "").replace(/\\r\\n/g, "\n")
-						: String(item.command ?? "");
+					const cmd =
+						typeof item.command === "string"
+							? item.command.replace(/^"[^"]*powershell[^"]*"\s+-\w+\s+/i, "").replace(/\\r\\n/g, "\n")
+							: String(item.command ?? "");
 					out.push(`$ ${cmd.trim()}`);
 					const agg = typeof item.aggregated_output === "string" ? item.aggregated_output.trim() : "";
 					if (agg) out.push(agg);
@@ -962,6 +963,7 @@ export class BacklogServer {
 				onStatusChange: typeof payload.onStatusChange === "string" ? payload.onStatusChange : undefined,
 				agent: typeof payload.agent === "string" ? payload.agent : undefined,
 				reviewAgent: typeof payload.reviewAgent === "string" ? payload.reviewAgent : undefined,
+				repo: typeof payload.repo === "string" ? payload.repo : undefined,
 			});
 			return Response.json(createdTask, { status: 201 });
 		} catch (error) {
@@ -1063,7 +1065,7 @@ export class BacklogServer {
 			updateInput.onStatusChange = updates.onStatusChange;
 		}
 
-		for (const field of ["agent", "reviewAgent"] as const) {
+		for (const field of ["agent", "reviewAgent", "repo"] as const) {
 			if (field in updates && (typeof updates[field] === "string" || updates[field] === null)) {
 				updateInput[field] = updates[field] as string | null;
 			}
@@ -1964,14 +1966,10 @@ export class BacklogServer {
 
 		const result = await Promise.all(
 			Array.from(this.latestDispatches(files).values()).map(async ({ stem, taskId, status }) => {
-				const { pidAlive, statusMatches, silentMs, running } = await this.resolveLiveness(
-					logsDir,
-					stem,
-					async () => {
-						const current = await this.freshTaskStatus(taskId, idById.get(taskId.toLowerCase()));
-						return current === status ? current : null;
-					},
-				);
+				const { pidAlive, statusMatches, silentMs, running } = await this.resolveLiveness(logsDir, stem, async () => {
+					const current = await this.freshTaskStatus(taskId, idById.get(taskId.toLowerCase()));
+					return current === status ? current : null;
+				});
 				const badge = deriveBadgeState({ running, pidAlive, statusMatches });
 				return {
 					taskId,
@@ -2025,23 +2023,38 @@ export class BacklogServer {
 		let usedErr = false;
 		try {
 			const err = await Bun.file(errPath).text();
-			if (err.trim().length > 100) { raw = err; usedErr = true; }
-		} catch { /* no .err file */ }
+			if (err.trim().length > 100) {
+				raw = err;
+				usedErr = true;
+			}
+		} catch {
+			/* no .err file */
+		}
 
 		if (!usedErr) {
-			try { raw = await Bun.file(logPath).text(); } catch { /* unreadable */ }
+			try {
+				raw = await Bun.file(logPath).text();
+			} catch {
+				/* unreadable */
+			}
 		}
 
 		// Check if agent process is still alive.
 		let done = true;
 		try {
 			const pidStr = await Bun.file(pidPath).text();
-			const pid = parseInt(pidStr.trim(), 10);
+			const pid = Number.parseInt(pidStr.trim(), 10);
 			if (pid > 0) {
-				try { process.kill(pid, 0); done = false; }
-				catch (e: unknown) { done = (e as NodeJS.ErrnoException).code !== "EPERM"; }
+				try {
+					process.kill(pid, 0);
+					done = false;
+				} catch (e: unknown) {
+					done = (e as NodeJS.ErrnoException).code !== "EPERM";
+				}
 			}
-		} catch { /* no .pid → done */ }
+		} catch {
+			/* no .pid → done */
+		}
 
 		return Response.json({ content: agentLogParse(raw, usedErr), done, logFile: matching });
 	}

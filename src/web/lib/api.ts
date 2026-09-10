@@ -240,10 +240,11 @@ export class ApiClient {
 
 	async updateTask(
 		id: string,
-		updates: Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent"> & {
+		updates: Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent" | "repo"> & {
 			milestone?: string | null;
 			agent?: string | null;
 			reviewAgent?: string | null;
+			repo?: string | null;
 		},
 	): Promise<Task> {
 		return this.fetchJson<Task>(`${API_BASE}/tasks/${id}`, {

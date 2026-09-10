@@ -17,7 +17,7 @@ export function registerTaskTools(server: McpServer, config: BacklogConfig): voi
 		{
 			name: "task_create",
 			description:
-				"Create a new task using Backlog.md. Set `agent`/`reviewAgent` to assign the coder/reviewer for the dispatch loop (use the configured agent aliases when the project defines them).",
+				"Create a new task using Backlog.md. Set `agent`/`reviewAgent` to assign the coder/reviewer for the dispatch loop (use the configured agent aliases when the project defines them). Set `repo` to target a sibling repository when one hub backlog drives work across several.",
 			inputSchema: taskCreateSchema,
 			annotations: { title: "Create Task", destructiveHint: false },
 		},
@@ -51,7 +51,7 @@ export function registerTaskTools(server: McpServer, config: BacklogConfig): voi
 		{
 			name: "task_edit",
 			description:
-				"Edit a Backlog.md task, including metadata, implementation plan/notes, dependencies, acceptance criteria, task-specific Definition of Done items, and the `agent`/`reviewAgent` dispatch assignment (pass an empty string to clear an agent field)",
+				"Edit a Backlog.md task, including metadata, implementation plan/notes, dependencies, acceptance criteria, task-specific Definition of Done items, the `agent`/`reviewAgent` dispatch assignment and the `repo` target (pass an empty string to clear any of those fields)",
 			inputSchema: taskEditSchema,
 			annotations: { title: "Edit Task", destructiveHint: false },
 		},

@@ -53,6 +53,7 @@ export function serializeTask(task: Task): string {
 		...(task.onStatusChange && { onStatusChange: task.onStatusChange }),
 		...(task.agent && { agent: task.agent }),
 		...(task.reviewAgent && { reviewAgent: task.reviewAgent }),
+		...(task.repo && { repo: task.repo }),
 	};
 
 	let contentBody = task.rawContent ?? "";

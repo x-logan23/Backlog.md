@@ -13,6 +13,7 @@ import {
 	resolveClosestMilestoneFilterValue,
 } from "../../../utils/milestone-filter.ts";
 import { resolveMilestoneInputForStorage } from "../../../utils/milestone-storage.ts";
+import { normalizeRepoValue } from "../../../utils/repo-filter.ts";
 import { buildTaskUpdateInput } from "../../../utils/task-edit-builder.ts";
 import { createTaskSearchIndex } from "../../../utils/task-search.ts";
 import { sortByOrdinalAndPriority } from "../../../utils/task-sorting.ts";
@@ -41,12 +42,14 @@ export type TaskCreateArgs = {
 	finalSummary?: string;
 	agent?: string;
 	reviewAgent?: string;
+	repo?: string;
 };
 
 export type TaskListArgs = {
 	status?: string;
 	assignee?: string;
 	milestone?: string;
+	repo?: string;
 	labels?: string[];
 	search?: string;
 	limit?: number;
@@ -131,6 +134,7 @@ export class TaskHandlers {
 				disableDefinitionOfDoneDefaults: args.disableDefinitionOfDoneDefaults,
 				agent: args.agent,
 				reviewAgent: args.reviewAgent,
+				repo: args.repo,
 			});
 
 			return await formatTaskCallResult(createdTask);
@@ -173,6 +177,11 @@ export class TaskHandlers {
 					(draft) =>
 						normalizeMilestoneFilterValue(resolveMilestoneFilterValue(draft.milestone ?? "")) === milestoneFilter,
 				);
+			}
+
+			if (args.repo) {
+				const repoFilter = normalizeRepoValue(args.repo);
+				drafts = drafts.filter((draft) => normalizeRepoValue(draft.repo ?? "") === repoFilter);
 			}
 
 			const labelFilters = args.labels ?? [];
@@ -222,6 +231,9 @@ export class TaskHandlers {
 		}
 		if (args.milestone) {
 			filters.milestone = args.milestone;
+		}
+		if (args.repo) {
+			filters.repo = args.repo;
 		}
 
 		const tasks = await this.core.queryTasks({

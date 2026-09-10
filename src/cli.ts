@@ -177,6 +177,7 @@ function hasCreateFieldFlags(options: Record<string, unknown>): boolean {
 			options.priority !== undefined ||
 			options.ordinal !== undefined ||
 			options.milestone !== undefined ||
+			options.repo !== undefined ||
 			options.plain ||
 			options.ac !== undefined ||
 			options.acceptanceCriteria !== undefined ||
@@ -206,6 +207,7 @@ function hasEditFieldFlags(options: Record<string, unknown>): boolean {
 			options.priority !== undefined ||
 			options.ordinal !== undefined ||
 			options.milestone !== undefined ||
+			options.repo !== undefined ||
 			options.clearMilestone ||
 			options.plain ||
 			options.addLabel !== undefined ||
@@ -1470,6 +1472,7 @@ taskCmd
 	.option("-m, --milestone <milestone>", "assign task to milestone by ID or title")
 	.option("--agent <agent>", "assign the coder agent for the dispatch loop (alias from config `agents`, or a binary name)")
 	.option("--review-agent <agent>", "assign the reviewer agent (defaults to --agent when omitted)")
+	.option("--repo <path>", "target repository, as a path relative to the project root")
 	.option("--draft")
 	.option("-p, --parent <taskId>", "specify parent task ID")
 	.option(
@@ -1581,6 +1584,7 @@ taskCmd
 				disableDefinitionOfDoneDefaults: options.dodDefaults === false,
 				agent: options.agent ? String(options.agent) : undefined,
 				reviewAgent: options.reviewAgent ? String(options.reviewAgent) : undefined,
+				repo: options.repo ? String(options.repo) : undefined,
 			});
 
 			if (usePlainOutput) {
@@ -1846,6 +1850,7 @@ taskCmd
 	.option("-s, --status <status>", "filter tasks by status (case-insensitive)")
 	.option("-a, --assignee <assignee>", "filter tasks by assignee")
 	.option("-m, --milestone <milestone>", "filter tasks by milestone (closest match, case-insensitive)")
+	.option("--repo <path>", "filter tasks by target repository")
 	.option("-p, --parent <taskId>", "filter tasks by parent task ID")
 	.option("--priority <priority>", "filter tasks by priority (high, medium, low)")
 	.option("--sort <field>", "sort tasks by field (priority, id)")
@@ -1866,6 +1871,9 @@ taskCmd
 		}
 		if (options.milestone) {
 			baseFilters.milestone = options.milestone;
+		}
+		if (options.repo) {
+			baseFilters.repo = String(options.repo);
 		}
 		if (options.priority) {
 			const priorityLower = options.priority.toLowerCase();
@@ -2128,6 +2136,7 @@ taskCmd
 	.option("--clear-milestone", "clear task milestone assignment")
 	.option("--agent <agent>", "set the coder agent for the dispatch loop (empty string clears it)")
 	.option("--review-agent <agent>", "set the reviewer agent (empty string clears it)")
+	.option("--repo <path>", "target repository relative to the project root (pass an empty string to clear)")
 	.option("--plain", "use plain text output after editing")
 	.option("--add-label <label>")
 	.option("--remove-label <label>")
@@ -2394,6 +2403,9 @@ taskCmd
 		}
 		if (milestoneValue !== undefined) {
 			editArgs.milestone = milestoneValue;
+		}
+		if (typeof options.repo === "string") {
+			editArgs.repo = options.repo;
 		}
 		if (labelValues.length > 0) {
 			editArgs.labels = labelValues;
