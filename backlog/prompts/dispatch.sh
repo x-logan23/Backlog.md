@@ -11,7 +11,13 @@
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# $0, not ${BASH_SOURCE[0]}: the array subscript is a bashism, and this script
+# is invoked as `sh dispatch.sh` by the hook. Under dash -- which IS /bin/sh on
+# Debian and Ubuntu -- the old form raised "Bad substitution", left script_dir
+# empty, pointed project_root somewhere else entirely, and the dispatcher then
+# exited 0 having silently done nothing. The script is executed, never sourced,
+# so $0 is the right answer anyway.
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompts_dir="$script_dir"
 project_root="$(cd "$script_dir/../.." && pwd)"
 
@@ -562,7 +568,7 @@ fi
             nohup claude --resume "$coder_session_id" --dangerously-skip-permissions $claude_model_args \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
         fi
-        disown
+        : # nohup already detaches; `disown` is a bash builtin dash does not have
     elif [ "$is_reviewer_resume" = "1" ]; then
         resume_msg="The coder has addressed the findings on task ${TASK_ID:-?}. Re-read the task via the Backlog.md MCP (task_view), verify every fix, run the tests, and move to Human Review if everything passes or request more changes if issues remain."
         resume_path="$log_file.resume"
@@ -580,7 +586,7 @@ fi
             nohup claude --resume "$reviewer_session_id" --dangerously-skip-permissions $claude_model_args \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
         fi
-        disown
+        : # nohup already detaches; `disown` is a bash builtin dash does not have
     else
     case "$agent_binary" in
         claude)
@@ -606,5 +612,5 @@ fi
             ;;
     esac
     fi
-    disown
+    : # nohup already detaches; `disown` is a bash builtin dash does not have
 ) > /dev/null 2>&1
