@@ -90,10 +90,16 @@ export interface ScaffoldFile {
  * files live under the chosen backlog directory; the role-scoped MCP configs
  * live under `.claude/`. All are written only when absent so re-init never
  * clobbers a project's customized prompts.
+ *
+ * `includeClientConfigs` drops the `.claude/` half. Those two files are Claude
+ * Code wiring rather than part of the loop itself, so a project that opted out
+ * of AI integration entirely (`integrationMode: "none"`) has no use for them —
+ * and writing them anyway left every such project with an untracked `.claude/`
+ * directory that nothing staged, ignored, or explained.
  */
-export function buildAgentLoopFiles(backlogDir: string): ScaffoldFile[] {
+export function buildAgentLoopFiles(backlogDir: string, includeClientConfigs = true): ScaffoldFile[] {
 	const p = `${backlogDir}/prompts`;
-	return [
+	const files: ScaffoldFile[] = [
 		{ path: `${p}/dispatch.ps1`, content: dispatchPs1 },
 		{ path: `${p}/dispatch.sh`, content: dispatchSh, executable: true },
 		{ path: `${p}/README.md`, content: promptsReadme },
@@ -106,7 +112,12 @@ export function buildAgentLoopFiles(backlogDir: string): ScaffoldFile[] {
 		{ path: `${p}/token-report.ps1`, content: tokenReportPs1 },
 		{ path: `${p}/create-mr.ps1`, content: createMrPs1 },
 		{ path: `${p}/watchdog.ps1`, content: watchdogPs1 },
-		{ path: ".claude/mcp-coder.json", content: `${JSON.stringify(mcpCoderJson, null, 2)}\n` },
-		{ path: ".claude/mcp-reviewer.json", content: `${JSON.stringify(mcpReviewerJson, null, 2)}\n` },
 	];
+	if (includeClientConfigs) {
+		files.push(
+			{ path: ".claude/mcp-coder.json", content: `${JSON.stringify(mcpCoderJson, null, 2)}\n` },
+			{ path: ".claude/mcp-reviewer.json", content: `${JSON.stringify(mcpReviewerJson, null, 2)}\n` },
+		);
+	}
+	return files;
 }
