@@ -195,6 +195,25 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onEdit, onDragStart, onDragEn
           {task.title}
         </h4>
 
+        {/* Slot: body-repo — which repository this task targets. First body
+            slot because on a hub board holding tasks for many services it is
+            the fastest way to tell what a card is about. Absent on
+            single-repo projects, where every task lives at the project root
+            and the slot renders nothing. */}
+        {!hiddenFields.has('repo') && task.repo && task.repo.trim() !== '' && (
+          <div className="mt-2">
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300 rounded transition-colors duration-200"
+              title={`Repo: ${task.repo}`}
+            >
+              <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+              </svg>
+              <span className="truncate max-w-[140px]">{task.repo}</span>
+            </span>
+          </div>
+        )}
+
         {/* Slot: body-milestone — renders only when the task has a
             milestone AND the field is not hidden. Placed above labels so
             adding it doesn't displace any existing field's position. */}

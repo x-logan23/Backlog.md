@@ -85,6 +85,35 @@ describe("TaskCard — slot visibility", () => {
 		expect(card.querySelector('[title^="Milestone:"]')).toBeNull();
 	});
 
+	it("does NOT render a repo slot when the task has no repo", () => {
+		// The single-repo default: nothing about the card changes.
+		const card = render(makeTask());
+		expect(card.querySelector('[title^="Repo:"]')).toBeNull();
+	});
+
+	it("renders the repo slot when the task has a repo and the field is not hidden", () => {
+		const card = render(makeTask({ repo: "payments-api" }));
+		const pill = card.querySelector('[title^="Repo:"]');
+		expect(pill).not.toBeNull();
+		expect(pill?.textContent).toContain("payments-api");
+	});
+
+	it("renders a nested repo path", () => {
+		const card = render(makeTask({ repo: "platform/billing" }));
+		expect(card.querySelector('[title^="Repo:"]')?.textContent).toContain("platform/billing");
+	});
+
+	it("hides the repo slot when hiddenFields includes 'repo'", () => {
+		const card = render(makeTask({ repo: "payments-api" }), new Set(["repo"]));
+		expect(card.querySelector('[title^="Repo:"]')).toBeNull();
+		expect(card.textContent).toContain("Sample title");
+	});
+
+	it("treats whitespace-only repo as absent", () => {
+		const card = render(makeTask({ repo: "   " }));
+		expect(card.querySelector('[title^="Repo:"]')).toBeNull();
+	});
+
 	it("hides the task id when hiddenFields includes 'id'", () => {
 		const card = render(makeTask({ id: "BACK-42" }), new Set(["id"]));
 		expect(card.textContent).not.toContain("BACK-42");

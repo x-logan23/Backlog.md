@@ -37,12 +37,14 @@ type TaskUpdatePayload = Partial<Task> & {
   disableDefinitionOfDoneDefaults?: boolean;
   agent?: string | null;
   reviewAgent?: string | null;
+  repo?: string | null;
 };
 
-type InlineMetaUpdatePayload = Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent"> & {
+type InlineMetaUpdatePayload = Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent" | "repo"> & {
   milestone?: string | null;
   agent?: string | null;
   reviewAgent?: string | null;
+  repo?: string | null;
 };
 
 const SectionHeader: React.FC<{ title: string; right?: React.ReactNode }> = ({ title, right }) => (
@@ -237,6 +239,7 @@ export const TaskDetailsModal: React.FC<Props> = ({
   const [showAdvanced, setShowAdvanced] = useState<boolean>(Boolean(task?.onStatusChange));
   const [agent, setAgent] = useState<string>(task?.agent || "");
   const [reviewAgent, setReviewAgent] = useState<string>(task?.reviewAgent || "");
+  const [repo, setRepo] = useState<string>(task?.repo || "");
   const [availableTasks, setAvailableTasks] = useState<Task[]>([]);
   const milestoneSelectionValue = resolveMilestoneToId(milestone);
   const hasMilestoneSelection = (milestoneEntities ?? []).some((milestoneEntity) => milestoneEntity.id === milestoneSelectionValue);
@@ -251,6 +254,7 @@ export const TaskDetailsModal: React.FC<Props> = ({
     onStatusChange: task?.onStatusChange || "",
     agent: task?.agent || "",
     reviewAgent: task?.reviewAgent || "",
+    repo: task?.repo || "",
     criteria: JSON.stringify(task?.acceptanceCriteriaItems || []),
     definitionOfDone: JSON.stringify(task?.definitionOfDoneItems || (isCreateMode ? defaultDefinitionOfDone : [])),
   }), [task, defaultDefinitionOfDone, isCreateMode]);
@@ -265,10 +269,11 @@ export const TaskDetailsModal: React.FC<Props> = ({
       onStatusChange !== baseline.onStatusChange ||
       agent !== baseline.agent ||
       reviewAgent !== baseline.reviewAgent ||
+      repo !== baseline.repo ||
       JSON.stringify(criteria) !== baseline.criteria ||
       JSON.stringify(definitionOfDone) !== baseline.definitionOfDone
     );
-  }, [title, description, plan, notes, finalSummary, onStatusChange, agent, reviewAgent, criteria, definitionOfDone, baseline]);
+  }, [title, description, plan, notes, finalSummary, onStatusChange, agent, reviewAgent, repo, criteria, definitionOfDone, baseline]);
 
   // Intercept Escape to cancel edit (not close modal) when in edit mode
   useEffect(() => {
@@ -318,6 +323,7 @@ export const TaskDetailsModal: React.FC<Props> = ({
     setShowAdvanced(Boolean(task?.onStatusChange));
     setAgent(task?.agent || "");
     setReviewAgent(task?.reviewAgent || "");
+    setRepo(task?.repo || "");
     setMode(isCreateMode ? "create" : "preview");
     setError(null);
     // Preload tasks for dependency picker
@@ -470,6 +476,7 @@ export const TaskDetailsModal: React.FC<Props> = ({
         // Empty string clears the field (server normalizes to null/delete).
         agent: (agent.trim() || null) as string | undefined,
         reviewAgent: (reviewAgent.trim() || null) as string | undefined,
+        repo: (repo.trim() || null) as string | undefined,
       };
 
       if (isCreateMode && onSubmit) {
@@ -1051,6 +1058,26 @@ export const TaskDetailsModal: React.FC<Props> = ({
               placeholder="Type name and press Enter"
               disabled={isFromOtherBranch}
             />
+          </div>
+
+          {/* Repository — only meaningful when one backlog drives work across
+              several repos. Left empty (the single-repo default) the
+              dispatcher runs the agent at the project root, as it always has. */}
+          <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3">
+            <SectionHeader title="Repository" />
+            <input
+              id="task-repo"
+              type="text"
+              value={repo}
+              onChange={(e) => setRepo(e.target.value)}
+              onBlur={(e) => handleInlineMetaUpdate({ repo: e.target.value.trim() || null })}
+              placeholder="payments-api — leave empty for the project root"
+              disabled={isFromOtherBranch}
+              className="w-full h-9 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-stone-500 dark:focus:ring-stone-400 focus:border-transparent transition-colors duration-200 disabled:opacity-60"
+            />
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Path relative to the project root, e.g. <code>payments-api</code> or <code>platform/billing</code>.
+            </p>
           </div>
 
           {/* Agents */}

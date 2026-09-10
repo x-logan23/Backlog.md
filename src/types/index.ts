@@ -339,8 +339,8 @@ export interface BoardColumnConfig {
  * is intentionally closed — adding a new option later is a code change,
  * not user config. The order here is documentation only; the actual
  * render order is pinned inside TaskCard.tsx (header-left → header-right
- * → body-milestone → body-labels → footer-left → footer-right) and the
- * UI exposes visibility toggles, not reordering.
+ * → body-repo → body-milestone → body-agent → body-labels → footer-left
+ * → footer-right) and the UI exposes visibility toggles, not reordering.
  *
  * Always-on card chrome (title, cross-branch banner/tooltip, priority
  * border accent, drag-state visuals) is rendered unconditionally and is
@@ -349,6 +349,7 @@ export interface BoardColumnConfig {
 export const CONFIGURABLE_CARD_FIELDS = [
 	"id",
 	"priority",
+	"repo",
 	"milestone",
 	"labels",
 	"createdDate",

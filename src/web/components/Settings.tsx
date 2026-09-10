@@ -819,6 +819,7 @@ interface CardFieldsSectionProps {
 const CARD_FIELD_LABELS: Record<ConfigurableCardField, string> = {
 	id: 'Task ID',
 	priority: 'Priority badge',
+	repo: 'Repository',
 	milestone: 'Milestone',
 	labels: 'Labels',
 	createdDate: 'Created date',
