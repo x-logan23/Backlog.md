@@ -130,12 +130,101 @@ if [ ! -f "$prompt_file" ]; then
     exit 0
 fi
 
+# ── Task file lookup ─────────────────────────────────────────────────────────
+# Resolved once, here, and reused by both the repo resolution below and the
+# agent/session-id resolution further down.
+#
+# Matched with an anchored, case-insensitive pattern rather than a bare
+# substring: task ids arrive uppercase (BACK-12) while filenames are lowercase
+# (`back-12 - Title.md`), which only matches at all on a case-insensitive
+# filesystem, and an unanchored `*BACK-4*` also matches `back-46` and
+# `back-466`. Either way you get the wrong task's frontmatter — tolerable when
+# it only picked an agent name, not when it decides which repository an agent
+# with skipped permissions is turned loose in. The loose glob stays as a
+# fallback so no existing project's naming stops resolving.
+#
+# The `|| true` on each substitution is load-bearing: this script runs under
+# `set -euo pipefail`, so a pipeline whose first stage exits non-zero (a find
+# that matches nothing) would otherwise abort the whole dispatch.
+task_file="$(find "$project_root/backlog/tasks" -maxdepth 1 -iname "${TASK_ID:-} - *.md" 2>/dev/null | head -1 || true)"
+if [ -z "$task_file" ]; then
+    task_file="$(find "$project_root/backlog/tasks" -name "*${TASK_ID:-}*" 2>/dev/null | head -1 || true)"
+fi
+
+# ── Target repository resolution ─────────────────────────────────────────────
+# A task may name the repository it targets (frontmatter `repo:`), so a single
+# hub backlog can drive work across sibling repositories. The value is a path
+# relative to the project root.
+#
+# No `repo:` is the normal, single-repo case: the agent runs at the project
+# root exactly as it always has, and everything below is skipped.
+#
+# This block is deliberately side-effect free so it can run before the dry-run
+# gate, and before the dedup and hop guards — a misconfigured repo must not
+# burn a hop claim, which counts coder/reviewer disagreement, not typos.
+task_repo=""
+if [ -n "$task_file" ] && [ -f "$task_file" ]; then
+    # `|| true`: no `repo:` line is the common case, and a non-matching grep
+    # under `set -o pipefail` would abort the dispatch.
+    task_repo="$(grep -m1 '^repo:' "$task_file" 2>/dev/null | sed "s/^repo:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
+fi
+
+agent_workdir="$project_root"
+repo_error=""
+if [ -n "$task_repo" ]; then
+    case "$task_repo" in
+        /*|~*) repo_error="absolute paths are not allowed; use a path relative to the project root" ;;
+    esac
+
+    if [ -z "$repo_error" ]; then
+        # cd + `pwd -P` resolves "..", symlinks and any other trickery in one
+        # step; the containment check below then sees the real destination
+        # rather than the string that was written down.
+        resolved_repo="$(cd "$project_root/$task_repo" 2>/dev/null && pwd -P || true)"
+        project_root_real="$(cd "$project_root" 2>/dev/null && pwd -P || true)"
+        if [ -z "$resolved_repo" ]; then
+            repo_error="no such directory: $project_root/$task_repo"
+        else
+            case "$resolved_repo" in
+                "$project_root_real"/*) ;;
+                # An agent launches with permissions skipped, so a task must
+                # never be able to point one at somewhere outside the project.
+                *) repo_error="resolves outside the project root ($resolved_repo)" ;;
+            esac
+        fi
+        # `.git` is a file, not a directory, in worktrees and submodules.
+        if [ -z "$repo_error" ] && [ ! -e "$resolved_repo/.git" ]; then
+            repo_error="not a git repository (no .git in $resolved_repo)"
+        fi
+        # A plain `[ ... ] && ...` here would be the last command in the block
+        # and, when false, would abort the script under `set -e`.
+        if [ -z "$repo_error" ]; then
+            agent_workdir="$resolved_repo"
+        fi
+    fi
+fi
+
+if [ -n "$repo_error" ]; then
+    echo "dispatch.sh: ${TASK_ID:-?} has repo '$task_repo' which cannot be used: $repo_error"
+else
+    echo "dispatch.sh: workdir=$agent_workdir${task_repo:+ (repo: $task_repo)}"
+fi
+
 # Build the full prompt: template body + task context.
+#
+# The repository line is only appended when the task names one. A single-repo
+# project gets exactly the context block it always got, byte for byte.
+repo_context=""
+if [ -n "$task_repo" ] && [ -z "$repo_error" ]; then
+    repo_context="
+Repository: $task_repo (you are already running inside it: $agent_workdir)"
+fi
+
 full_prompt="$(cat "$prompt_file")
 
 ---
 Task: ${TASK_ID:-?} — ${TASK_TITLE:-?}
-Status: ${OLD_STATUS:-?} → ${NEW_STATUS:-?}"
+Status: ${OLD_STATUS:-?} → ${NEW_STATUS:-?}$repo_context"
 
 # Per-invocation log file so concurrent hooks don't clobber each other.
 # log_dir, sanitize() and safe_task_id are set above, before the Blocked branch.
@@ -145,8 +234,40 @@ log_file="$log_dir/$timestamp-$$-$safe_task_id-$safe_status.log"
 prompt_path="$log_file.prompt"
 printf '%s' "$full_prompt" > "$prompt_path"
 
-# Dry-run mode: do everything except spawn the agent.
+# Dry-run mode: do everything except spawn the agent. Sits after repo
+# resolution (which is side-effect free) so the resolved working directory and
+# any rejection reason are both observable without launching anything or
+# touching task state.
 if [ "${BACKLOG_DISPATCH_DRY_RUN:-}" = "1" ]; then
+    exit 0
+fi
+
+# ── Unusable repo: park the task instead of dispatching ──────────────────────
+# Same treatment the loop guard gives a fenced task, and for the same reason:
+# refusing to dispatch while leaving the task where it was makes it look
+# healthy on the board, and the only trace is a log line nobody reads. A task
+# pointing at a repo that does not exist needs a person, so it goes in front of
+# one.
+#
+# --append-notes, never --notes: the latter replaces the whole notes section.
+if [ -n "$repo_error" ]; then
+    repo_note="Dispatch blocked: the task targets repo '$task_repo', which cannot be used.
+Reason: $repo_error
+Transition: ${OLD_STATUS:-?} -> ${NEW_STATUS:-?}. Log: $log_file
+
+Set a valid repo (a path relative to the project root, e.g. payments-api), or
+clear the field to run at the project root, then move this task out of Blocked."
+
+    if (cd "$project_root" && backlog task edit "${TASK_ID:-}" --append-notes "$repo_note" >/dev/null 2>&1); then
+        :
+    else
+        echo "dispatch.sh: could not append the repo failure to ${TASK_ID:-?}."
+    fi
+    if (cd "$project_root" && backlog task edit "${TASK_ID:-}" -s Blocked >/dev/null 2>&1); then
+        echo "dispatch.sh: ${TASK_ID:-?} moved to Blocked - unusable repo."
+    else
+        echo "dispatch.sh: ${TASK_ID:-?} stays in ${NEW_STATUS:-?} - no Blocked status configured, or the CLI is unavailable."
+    fi
     exit 0
 fi
 
@@ -283,14 +404,21 @@ find "$log_dir" -maxdepth 1 -type f -name '*.hop-*' -mtime +14 -delete 2>/dev/nu
 task_agent=""
 task_review_agent=""
 coder_session_id=""
-task_file="$(find "$project_root/backlog/tasks" -name "*${TASK_ID:-}*" 2>/dev/null | head -1)"
+# task_file was resolved once, up with the repo resolution.
 if [ -n "$task_file" ] && [ -f "$task_file" ]; then
-    task_agent="$(grep -m1 '^agent:' "$task_file" 2>/dev/null | sed "s/^agent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"")"
-    task_review_agent="$(grep -m1 '^reviewAgent:' "$task_file" 2>/dev/null | sed "s/^reviewAgent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"")"
+    # Every one of these greps legitimately finds nothing on some task: a human
+    # task has no `agent:`, most tasks have no `reviewAgent:`, and a first
+    # dispatch has no session id yet. Under `set -o pipefail` a non-matching
+    # grep makes the whole substitution non-zero and `set -e` then aborted the
+    # dispatch — so a human task exited 1 here instead of reaching the "not an
+    # agent task" check ten lines below, and every such transition was reported
+    # as a failed status-change callback. Hence `|| true` on each.
+    task_agent="$(grep -m1 '^agent:' "$task_file" 2>/dev/null | sed "s/^agent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
+    task_review_agent="$(grep -m1 '^reviewAgent:' "$task_file" 2>/dev/null | sed "s/^reviewAgent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
     # Extract the last "Session ID: <uuid>" from the task body for --resume on rework.
     # Match both UUID (claude/codex) and ses_* (opencode) session ID formats.
-    coder_session_id="$(grep -oE 'Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Session ID: //')"
-    reviewer_session_id="$(grep -oE 'Reviewer Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Reviewer Session ID: //')"
+    coder_session_id="$(grep -oE 'Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Session ID: //' || true)"
+    reviewer_session_id="$(grep -oE 'Reviewer Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Reviewer Session ID: //' || true)"
 fi
 
 # Tasks without an `agent:` field are human tasks — do not dispatch an
@@ -394,8 +522,13 @@ if [ "$is_resume_capable" = "1" ] && \
 fi
 
 # ── Per-agent launch ─────────────────────────────────────────────────────────
+# The agent runs in the task's repository when it names one, and at the project
+# root otherwise. It can still reach the backlog either way: the CLI and the MCP
+# server find the project by walking UP from the working directory, and they do
+# not stop at a git boundary, so a hub backlog above the repos stays reachable
+# from inside any of them.
 (
-    cd "$project_root"
+    cd "$agent_workdir"
     if [ "$is_coder_rework" = "1" ]; then
         rework_msg="The reviewer requested changes on task ${TASK_ID:-?}. Read the task via the Backlog.md MCP (task_view), find the latest Review section with CHANGES REQUESTED, address every finding, run the tests, and move the task back to In Review when done."
         rework_path="$log_file.rework"
