@@ -24,8 +24,12 @@ import type { Core } from "./backlog.ts";
  * written only when absent so re-init never clobbers customized prompts. Failures
  * are non-fatal: a scaffolding hiccup must not abort project initialization.
  */
-async function scaffoldAgentLoopFiles(projectRoot: string, backlogDir: string): Promise<void> {
-	for (const file of buildAgentLoopFiles(backlogDir)) {
+async function scaffoldAgentLoopFiles(
+	projectRoot: string,
+	backlogDir: string,
+	includeClientConfigs = true,
+): Promise<void> {
+	for (const file of buildAgentLoopFiles(backlogDir, includeClientConfigs)) {
 		const target = join(projectRoot, file.path);
 		if (existsSync(target)) continue;
 		try {
@@ -224,7 +228,10 @@ export async function initializeProject(
 		const backlogDir = core.filesystem.backlogDirName || "backlog";
 		applyAgentLoopConfigDefaults(config, backlogDir);
 		await core.filesystem.saveConfig(config);
-		await scaffoldAgentLoopFiles(projectRoot, backlogDir);
+		// The `.claude/` MCP configs are Claude Code wiring, so they are skipped when
+		// the user opted out of AI integration. Writing them regardless left every
+		// such project with an untracked `.claude/` that nothing staged or ignored.
+		await scaffoldAgentLoopFiles(projectRoot, backlogDir, integrationMode !== "none");
 	} else {
 		const normalizedBacklogDirectory = normalizeProjectBacklogDirectory(options.backlogDirectory);
 		const inferredBacklogDirectorySource = normalizedBacklogDirectory
@@ -263,7 +270,7 @@ export async function initializeProject(
 		await core.filesystem.ensureBacklogStructure();
 		await core.filesystem.saveConfig(config);
 		await core.ensureConfigLoaded();
-		await scaffoldAgentLoopFiles(projectRoot, selectedBacklogDirectory);
+		await scaffoldAgentLoopFiles(projectRoot, selectedBacklogDirectory, integrationMode !== "none");
 	}
 
 	const mcpResults: Record<string, string> = {};
