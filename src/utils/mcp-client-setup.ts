@@ -66,6 +66,13 @@ export async function runMcpClientSetupCommand(
 
 	if (exitCode !== 0) {
 		const details = [capturedStderr.trim(), capturedStdout.trim()].filter(Boolean).join("\n");
+		// An already-registered server is success, not failure. `claude mcp add`
+		// exits 1 with "MCP server <name> already exists in <scope> config", and
+		// the README tells you to run `backlog init` again on a machine that is
+		// already set up -- so surfacing that as "Unable to configure Claude Code
+		// automatically" makes the documented flow look broken on exactly the
+		// machines where it had already worked.
+		if (/already exists/i.test(details)) return;
 		throw new Error(`Command exited with code ${exitCode}${details ? `: ${details}` : ""}`);
 	}
 }
