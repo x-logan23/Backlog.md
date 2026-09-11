@@ -21,6 +21,15 @@ export interface ReorderTaskPayload {
 	targetMilestone?: string | null;
 }
 
+export type TaskUpdateRequest = Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent" | "repo"> & {
+	milestone?: string | null;
+	agent?: string | null;
+	reviewAgent?: string | null;
+	repo?: string | null;
+	commentsAppend?: string[];
+	commentAuthor?: string;
+};
+
 export interface InitializationStatus {
 	initialized: boolean;
 	projectPath: string;
@@ -44,7 +53,12 @@ export class ApiError extends Error {
 	}
 
 	static fromResponse(response: Response, data?: unknown): ApiError {
-		const message = `HTTP ${response.status}: ${response.statusText}`;
+		const errorMessage =
+			typeof data === "object" && data !== null && "error" in data ? (data as { error?: unknown }).error : undefined;
+		const message =
+			typeof errorMessage === "string" && errorMessage.trim().length > 0
+				? errorMessage
+				: `HTTP ${response.status}: ${response.statusText}`;
 		return new ApiError(message, response.status, response.statusText, data);
 	}
 }
@@ -238,15 +252,7 @@ export class ApiClient {
 		});
 	}
 
-	async updateTask(
-		id: string,
-		updates: Omit<Partial<Task>, "milestone" | "agent" | "reviewAgent" | "repo"> & {
-			milestone?: string | null;
-			agent?: string | null;
-			reviewAgent?: string | null;
-			repo?: string | null;
-		},
-	): Promise<Task> {
+	async updateTask(id: string, updates: TaskUpdateRequest): Promise<Task> {
 		return this.fetchJson<Task>(`${API_BASE}/tasks/${id}`, {
 			method: "PUT",
 			body: JSON.stringify(updates),
