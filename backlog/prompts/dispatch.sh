@@ -9,9 +9,26 @@
 # Picks the prompt file matching $NEW_STATUS, reads the per-task agent/reviewAgent
 # field from the task frontmatter, and launches the right CLI in the background.
 
-set -euo pipefail
+set -eu
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# `pipefail` is not POSIX. dash only gained it in 0.5.12, and an older dash --
+# which is what /bin/sh is on some Debian and Ubuntu images -- answers
+# "Illegal option -o pipefail" and exits 2 before doing anything at all, which
+# is the whole dispatch loop dead with a message nobody reads. Ask for it in a
+# subshell first and carry on without it where it is missing: every pipeline
+# whose failure would matter here is already guarded with `|| true`, so its
+# absence changes no behaviour.
+if (set -o pipefail) 2>/dev/null; then
+    set -o pipefail
+fi
+
+# $0, not ${BASH_SOURCE[0]}: the array subscript is a bashism, and this script
+# is invoked as `sh dispatch.sh` by the hook. Under dash -- which IS /bin/sh on
+# Debian and Ubuntu -- the old form raised "Bad substitution", left script_dir
+# empty, pointed project_root somewhere else entirely, and the dispatcher then
+# exited 0 having silently done nothing. The script is executed, never sourced,
+# so $0 is the right answer anyway.
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompts_dir="$script_dir"
 project_root="$(cd "$script_dir/../.." && pwd)"
 
@@ -562,7 +579,7 @@ fi
             nohup claude --resume "$coder_session_id" --dangerously-skip-permissions $claude_model_args \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
         fi
-        disown
+        : # nohup already detaches; `disown` is a bash builtin dash does not have
     elif [ "$is_reviewer_resume" = "1" ]; then
         resume_msg="The coder has addressed the findings on task ${TASK_ID:-?}. Re-read the task via the Backlog.md MCP (task_view), verify every fix, run the tests, and move to Human Review if everything passes or request more changes if issues remain."
         resume_path="$log_file.resume"
@@ -580,7 +597,7 @@ fi
             nohup claude --resume "$reviewer_session_id" --dangerously-skip-permissions $claude_model_args \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
         fi
-        disown
+        : # nohup already detaches; `disown` is a bash builtin dash does not have
     else
     case "$agent_binary" in
         claude)
@@ -606,5 +623,5 @@ fi
             ;;
     esac
     fi
-    disown
+    : # nohup already detaches; `disown` is a bash builtin dash does not have
 ) > /dev/null 2>&1
