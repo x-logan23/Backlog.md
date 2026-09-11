@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from "react";
 
 export interface AgentPhaseStatus {
 	running: boolean;
@@ -35,12 +35,18 @@ let intervalId: ReturnType<typeof setInterval> | null = null;
 let consumerCount = 0;
 
 function notify() {
-	for (const fn of listeners) fn();
+	// Braces, not a concise body: the arrow returned each listener's value,
+	// which `useIterableCallbackReturn` rejects because a value returned to
+	// forEach is silently discarded and usually signals a mistake. Here it was
+	// harmless, but it is the error that fails `bun run lint` in CI.
+	for (const fn of listeners) {
+		fn();
+	}
 }
 
 async function poll() {
 	try {
-		const res = await fetch('/api/agent-status');
+		const res = await fetch("/api/agent-status");
 		if (!res.ok) return;
 		const data: ApiEntry[] = await res.json();
 		const next: StatusMap = {};
@@ -53,9 +59,9 @@ async function poll() {
 			};
 			const entry = next[item.taskId];
 			if (entry) {
-				if (item.status === 'In Progress') {
+				if (item.status === "In Progress") {
 					entry.coder = phase;
-				} else if (item.status === 'In Review') {
+				} else if (item.status === "In Review") {
 					entry.reviewer = phase;
 				}
 			}

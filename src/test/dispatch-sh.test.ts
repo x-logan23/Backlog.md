@@ -245,6 +245,36 @@ describe("dispatch.sh — symlinked repositories", () => {
 	});
 });
 
+describe("dispatch.sh — runs under a strict POSIX shell", () => {
+	// /bin/sh is dash on Debian and Ubuntu but bash on macOS, so a bashism is
+	// invisible locally and only shows up on Linux. It has bitten this script
+	// once already: `${BASH_SOURCE[0]}` raised "Bad substitution" under dash,
+	// which left script_dir empty, pointed project_root somewhere else, and
+	// made the dispatcher exit 0 having silently done nothing — the whole loop
+	// dead on Ubuntu with no error anyone would notice.
+	const dash = Bun.which("dash");
+	const dashTest = shouldRun && dash ? test : test.skip;
+
+	dashTest("resolves the repo identically under dash", () => {
+		const { projectRoot, realProjectRoot, promptsDir } = makeProject("repo: payments-api\n");
+		mkdirSync(join(projectRoot, "payments-api", ".git"), { recursive: true });
+		const result = spawnSync(String(dash), [join(promptsDir, "dispatch.sh")], {
+			encoding: "utf8",
+			env: {
+				...process.env,
+				TASK_ID: "BACK-1",
+				TASK_TITLE: "Sample task",
+				OLD_STATUS: "To Do",
+				NEW_STATUS: "In Progress",
+				BACKLOG_DISPATCH_DRY_RUN: "1",
+			},
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).not.toContain("Bad substitution");
+		expect(result.stdout).toContain(`workdir=${join(realProjectRoot, "payments-api")}`);
+	});
+});
+
 describe("dispatch.sh — tasks with no agent", () => {
 	guarded("exits cleanly and launches nothing for a human task", () => {
 		// Regression: `set -o pipefail` plus a non-matching `grep '^agent:'`
