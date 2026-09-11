@@ -1,7 +1,7 @@
-# context.md — live agent panel work (session of 2026-09-02/04)
+# context.md — working notes
 
-Working notes for whoever picks this branch up next. `FORK_CONTEXT.md` is still the
-best account of *why the fork exists* and how the hook/watcher machinery was
+Handoff notes, **newest session first**. `FORK_CONTEXT.md` is still the best
+account of *why the fork exists* and how the hook/watcher machinery was
 originally built; this file covers what changed on top of it, what turned out to
 be wrong in it, and what is left.
 
@@ -9,6 +9,159 @@ Written in English to match the code, comments and commit messages;
 `FORK_CONTEXT.md` is in Spanish and stays that way.
 
 ---
+
+# Session of 2026-09-10 — multi-repo dispatch, web theming, CI
+
+## Why this session happened
+
+The fork is now used at Bankaya, a microservices shop: many small repos cloned
+side by side, no monorepo. Running `backlog init` in each would scatter task
+state across N repos and fragment the board. The goal was one hub backlog above
+the repos, with each task naming the repo it targets, and the dispatcher running
+the agent inside that repo.
+
+## Where things stand
+
+**Merged to `main`:**
+
+- **#7 — multi-repo dispatch.** Optional `repo` field on tasks (types, markdown,
+  Core, CLI `--repo` on create/edit/list, MCP create/edit/list, server, plain
+  text), a card slot + Settings toggle + modal editor, and both dispatchers
+  resolving the repo and running the agent inside it.
+- **#8 — web theming.** `theme` config key naming
+  `<backlogDir>/themes/<name>.css`, served at `GET /theme.css`.
+
+**Open: #10 — CI lint + `install:local`.** Three commits, ready for review.
+
+## The two things most worth knowing
+
+### 1. Theming works because Tailwind v4 compiles to custom properties
+
+Every utility resolves to a variable — `.bg-gray-50` is
+`background-color: var(--color-gray-50)` — and the whole palette is declared on
+`:root`. So a theme is *only* variable overrides and needs **no component
+changes**. Read per request, so editing a palette needs a reload, not a rebuild.
+
+Two non-obvious constraints, both already cost time once:
+
+- **A theme file must stay unlayered.** Tailwind emits everything inside
+  `@layer` (the palette lives in `@layer theme`), and unlayered CSS beats
+  layered CSS *regardless of source order*. That is also why the injected
+  `<link>` landing before the bundled stylesheet is fine, and why nobody should
+  "fix" that ordering.
+- **A static `<link href="/theme.css">` breaks the build.** Bun's HTML bundler
+  resolves markup hrefs at build time and cannot resolve a runtime-only route.
+  The link is injected by a head script instead.
+
+### 2. CI has never run the test suite (fixed in #10, not yet merged)
+
+`bun run lint` failed on one non-auto-fixable rule, and fail-fast then cancelled
+the macOS and Windows jobs — so `bun test` never executed on any platform.
+`compile-and-smoke-test` passing made it look partially healthy.
+
+Fixing that immediately surfaced **two Linux-only dispatcher bugs**, both
+pre-existing and both silent:
+
+- `${BASH_SOURCE[0]}` is a bashism. `/bin/sh` is bash on macOS but **dash** on
+  Debian/Ubuntu, which answers `Bad substitution` — leaving `script_dir` empty,
+  `project_root` wrong, and the dispatcher exiting **0 having done nothing**.
+  Since init writes `onStatusChange: 'sh ".../dispatch.sh"'`, the whole agent
+  loop has been dead on Ubuntu for as long as the POSIX dispatcher existed.
+- `set -o pipefail` is not POSIX; older dash exits **2** on it. This was hiding
+  behind the first fix, which is why the first attempt did not clear CI.
+
+Neither reproduces on macOS, and Homebrew's dash (0.5.13.5) is new enough to
+have `pipefail`, so local testing cannot catch them either. There is now a
+dash-guarded regression test. **Lesson: this script must be tested under dash,
+not just `sh`.**
+
+## Review findings from #7, worth not re-learning
+
+A Windows review caught two real holes:
+
+- **`GetFullPath` is not equivalent to `pwd -P`.** One is a string operation,
+  the other touches the filesystem. `GetFullPath` collapses `..` but never
+  follows reparse points, so a **directory junction** inside the project root
+  pointing outside it passed containment and would have handed an agent a
+  working directory outside the project. PowerShell 5.1 has no
+  `ResolveLinkTarget`, so `dispatch.ps1` now **refuses to traverse** a reparse
+  point — candidate *and every ancestor*, because `repo: link/inner` hides the
+  junction above the leaf.
+  **The dispatchers now differ on purpose:** POSIX resolves a link and accepts
+  one staying inside the project; Windows refuses either way. Documented in
+  `backlog/prompts/README.md`.
+- **The loose fallback lookup could select a neighbouring task.** `BACK-1`
+  matched `BACK-12`'s file given a filename the anchored pattern misses. Both
+  dispatchers now confirm the file's `id:` before trusting its `repo:`.
+
+## What is left
+
+1. **Merge #10.** It does not turn CI green and is not meant to — it makes CI
+   *informative*. Seven pre-existing failures remain on Ubuntu; locally on macOS
+   the set is **10**, and the three extras are all editor-related
+   (`editTaskInTui` ×2, `openInEditor`), so those look macOS-specific while the
+   other seven reproduce on both. Logan is investigating those separately.
+2. **Consider `fail-fast: false`** on the CI matrix. Until the seven are fixed,
+   macOS and Windows results stay invisible.
+3. **The orange header — the open design decision.** Three theme variants exist
+   and the palette work has gone about as far as it can. What actually makes
+   bankaya.com.mx recognisable is a **solid orange header bar**, and a theme
+   cannot produce it: the header and sidebar are painted with `bg-gray-100` /
+   `dark:bg-gray-800`, the *same tokens* as cards, chips and hover states, so
+   overriding them colours everything. Needs a component change (~20 lines in
+   `Layout`/`SideNavigation`). **Undecided: top bar only, or top bar + sidebar.**
+   The second is a lot of chrome competing with the cards on a tool you stare at
+   all day.
+4. **`dispatch.sh` ignores the role-scoped MCP configs.** Only `dispatch.ps1`
+   passes `--strict-mcp-config --mcp-config .claude/mcp-{coder,reviewer}.json`.
+   On POSIX, dispatched agents use the ambient user-scope config, so coder and
+   reviewer get the same servers. `.claude/mcp-coder.json` also references
+   `npx.cmd`, which is Windows-only.
+5. **The opt-in `Testing` runner** is still invoked with the project root, not
+   the task's repo.
+6. **Per-repo merge requests.** `create-mr.ps1` takes a single
+   `GITLAB_PROJECT_ID`; Bankaya is on **Bitbucket**. Either the reviewer agent
+   opens PRs via MCP, or a per-repo variant is needed.
+
+## Environment facts that cost time this session
+
+- **The hub lives at `~/code`**, outside this repo, created with
+  `backlog init --no-git` (filesystem-only). Prefix `bnk`, full agent-loop
+  statuses, `shell: auto`, POSIX dispatcher. The five service repos and this
+  repo are siblings under it. `~/code/Backlog.md` keeps its own backlog —
+  verified that root resolution picks the nearest, so the two do not collide.
+- **Theme files are in `~/code/backlog/themes/`, deliberately not in this repo**
+  — brand hexes plus the company name do not belong in a public fork. Three
+  variants: `bankaya` (navy neutrals, dark-first), `bankaya-warm` (warm charcoal
+  surfaces — the one that finally read as orange), `bankaya-light` (cool
+  neutrals, light-first, currently active).
+- **The grey ramp does two unrelated jobs**, and missing this is what made the
+  first theme look blue: in light mode its dark steps are *text*
+  (`text-gray-900` ×157), in dark mode the same steps are *surfaces*
+  (`dark:bg-gray-800` ×113). Brand navy is right for the first and drowns the
+  second. Hence the separate `.dark` block. Warm greys read as *dirty* against
+  white, so light mode wants the cool axis and dark mode the warm one.
+- **`install:local` produces a binary macOS kills on sight** (`Killed: 9`):
+  copying over the existing file invalidates its ad-hoc signature. Fixed in #10
+  (`rm` before `cp`, re-sign, fail loudly). Until that merges, install by hand.
+- **`backlog` is on PATH via `~/.local/bin/backlog` → `~/.bun/bin/backlog`.**
+  `~/.bun/bin` is not on PATH on this machine; the symlink is what makes
+  `install:local` reach it.
+- **git remote is HTTPS**, not SSH: the ed25519 key is not on the GitHub
+  account, and `gh auth login` was done with the HTTPS protocol. `gh` is
+  installed. Bitbucket uses a separate key and is unaffected.
+- **`Bankaya_2022_short brandbook.pdf` sits in this repo's working tree** and is
+  excluded only via `.git/info/exclude` (local, not committed). The remote is a
+  **public** fork, so one `git add -A` would publish it. It should be moved out
+  of the repo; an exclude protects this clone only.
+- The brandbook palette, for reference: Naranja `#FE411A`, Rosa `#FB2048`,
+  Azul `#2364E6`, White Pearl `#F0F2F9`, Black blue `#101239`. Azul converts to
+  almost exactly Tailwind's `blue-600`, so the stock UI was already on-brand for
+  blue.
+
+---
+
+# Session of 2026-09-02/04 — live agent panel work
 
 ## Where things stand
 
