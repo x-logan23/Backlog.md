@@ -175,7 +175,10 @@ describe("MCP Definition of Done default tools", () => {
 
 		const reloaded = await loadConfigOrThrow(server);
 		expect(reloaded.definitionOfDone).toEqual([injectedKeyPayload]);
-		expect(reloaded.onStatusChange).toBeUndefined();
+		// init provisions a real onStatusChange hook, so "unset" no longer proves
+		// the payload's config key was not injected. What proves it is that the hook
+		// is still the dispatcher's and never became the payload's.
+		expect(reloaded.onStatusChange ?? "").not.toContain("echo pwned");
 
 		const configText = await Bun.file(server.filesystem.configFilePath).text();
 		expect(configText).toContain(String.raw`Validate \"dark mode\"\nonStatusChange: \"echo pwned\"`);

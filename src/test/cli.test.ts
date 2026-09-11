@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { $ } from "bun";
+import { AGENT_LOOP_STATUSES } from "../constants/agent-loop-templates.ts";
 import { Core, isGitRepository } from "../index.ts";
 import { parseTask } from "../markdown/parser.ts";
 import { extractStructuredSection } from "../markdown/structured-sections.ts";
@@ -49,7 +50,7 @@ describe("CLI Integration", () => {
 			// Verify config content
 			const config = await core.filesystem.loadConfig();
 			expect(config?.projectName).toBe("CLI Test Project");
-			expect(config?.statuses).toEqual(["To Do", "In Progress", "In Review", "Human Review", "Done"]);
+			expect(config?.statuses).toEqual([...AGENT_LOOP_STATUSES]);
 			expect(config?.defaultStatus).toBe("To Do");
 
 			// Verify git commit was created
@@ -556,7 +557,7 @@ describe("CLI Integration", () => {
 
 			// Load and verify default config status order
 			const config = await core.filesystem.loadConfig();
-			expect(config?.statuses).toEqual(["To Do", "In Progress", "In Review", "Human Review", "Done"]);
+			expect(config?.statuses).toEqual([...AGENT_LOOP_STATUSES]);
 		});
 
 		it("should filter tasks by status", async () => {
@@ -1544,7 +1545,7 @@ describe("CLI Integration", () => {
 
 			const config = await core.filesystem.loadConfig();
 			const statuses = config?.statuses || [];
-			expect(statuses).toEqual(["To Do", "In Progress", "In Review", "Human Review", "Done"]);
+			expect(statuses).toEqual([...AGENT_LOOP_STATUSES]);
 
 			// Test the kanban board generation
 			const { generateKanbanBoardWithMetadata } = await import("../board.ts");
@@ -1585,7 +1586,7 @@ describe("CLI Integration", () => {
 
 			// Should return board with metadata, configured status columns, and empty-state message
 			expect(board).toContain("# Kanban Board Export");
-			expect(board).toContain("| To Do | In Progress | Done |");
+			expect(board).toContain(`| ${AGENT_LOOP_STATUSES.join(" | ")} |`);
 			expect(board).toContain("No tasks found");
 		});
 

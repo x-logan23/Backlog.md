@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { $ } from "bun";
+import { AGENT_LOOP_STATUSES } from "../constants/agent-loop-templates.ts";
 import { Core } from "../core/backlog.ts";
 import type { Document, Task } from "../types/index.ts";
 import { createUniqueTestDir, initializeTestProject, safeCleanup } from "./test-utils.ts";
@@ -42,7 +43,7 @@ describe("Core", () => {
 
 			const config = await core.filesystem.loadConfig();
 			expect(config?.projectName).toBe("Test Project");
-			expect(config?.statuses).toEqual(["To Do", "In Progress", "In Review", "Human Review", "Done"]);
+			expect(config?.statuses).toEqual([...AGENT_LOOP_STATUSES]);
 			expect(config?.defaultStatus).toBe("To Do");
 		});
 
