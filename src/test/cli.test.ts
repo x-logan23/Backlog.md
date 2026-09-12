@@ -14,6 +14,11 @@ import { createUniqueTestDir, initializeTestProject, safeCleanup } from "./test-
 let TEST_DIR: string;
 const CLI_PATH = join(process.cwd(), "src", "cli.ts");
 const normalizeCliOutput = (output: string) => output.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+// Derived, not hardcoded: upstream tests assert the three-status default it
+// ships, and this fork replaces it with the agent-loop pipeline. Deriving keeps
+// the assertion true if the pipeline changes again (Blocked was added to it).
+const DEFAULT_STATUS_LIST = AGENT_LOOP_STATUSES.join(", ");
+const DRAFT_STATUS_LIST = `Draft, ${DEFAULT_STATUS_LIST}`;
 
 describe("CLI Integration", () => {
 	beforeEach(async () => {
@@ -262,11 +267,11 @@ describe("CLI Integration", () => {
 
 			expect(createHelp).toContain("title: String");
 			expect(createHelp).toContain("description: Markdown");
-			expect(createHelp).toContain("status: one of configured statuses: Draft, To Do, In Progress, Done");
+			expect(createHelp).toContain(`status: one of configured statuses: ${DRAFT_STATUS_LIST}`);
 			expect(createHelp).toContain("priority: one of: high, medium, low");
 			expect(createHelp).toContain("ordinal: Integer");
-			expect(listHelp).toContain("status: one of configured statuses: To Do, In Progress, Done");
-			expect(listHelp).not.toContain("status: one of configured statuses: Draft, To Do, In Progress, Done");
+			expect(listHelp).toContain(`status: one of configured statuses: ${DEFAULT_STATUS_LIST}`);
+			expect(listHelp).not.toContain(`status: one of configured statuses: ${DRAFT_STATUS_LIST}`);
 			expect(listHelp).toContain("priority: one of: high, medium, low");
 			expect(listHelp).toContain("labels: Comma-separated strings");
 			expect(listHelp).toContain("search: String");
@@ -274,8 +279,8 @@ describe("CLI Integration", () => {
 			expect(listHelp).toContain("sort: one of: priority, id");
 			expect(listHelp).toContain('backlog task list --labels frontend,bug --search "login" --limit 10 --plain');
 			expect(editHelp).toContain("taskId: Task ID");
-			expect(editHelp).toContain("status: one of configured statuses: To Do, In Progress, Done");
-			expect(editHelp).not.toContain("status: one of configured statuses: Draft, To Do, In Progress, Done");
+			expect(editHelp).toContain(`status: one of configured statuses: ${DEFAULT_STATUS_LIST}`);
+			expect(editHelp).not.toContain(`status: one of configured statuses: ${DRAFT_STATUS_LIST}`);
 			expect(editHelp).toContain("plan: Markdown");
 			expect(editHelp).toContain("Writes:");
 			expect(completeHelp).toContain("cleanup procedure");
@@ -322,8 +327,8 @@ describe("CLI Integration", () => {
 			expect(configHelp).toContain("key: one of: defaultEditor, projectName, defaultStatus");
 			expect(configHelp).toContain("value: String");
 			expect(searchHelp).toContain("type: one or more of: task, document, decision");
-			expect(searchHelp).toContain("status: one of configured statuses: To Do, In Progress, Done");
-			expect(searchHelp).not.toContain("status: one of configured statuses: Draft, To Do, In Progress, Done");
+			expect(searchHelp).toContain(`status: one of configured statuses: ${DEFAULT_STATUS_LIST}`);
+			expect(searchHelp).not.toContain(`status: one of configured statuses: ${DRAFT_STATUS_LIST}`);
 			expect(searchHelp).toContain("priority: one of: high, medium, low");
 			expect(searchHelp).toContain("modified-file: Project-root-relative path");
 			expect(cleanupHelp).toContain("Writes:");
