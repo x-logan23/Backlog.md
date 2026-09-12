@@ -9,23 +9,24 @@
 // binary — there is no `backlog/prompts` directory next to the executable to
 // read from at runtime. init writes them into the target project instead.
 
-import dispatchPs1 from "../../backlog/prompts/dispatch.ps1" with { type: "text" };
-import dispatchSh from "../../backlog/prompts/dispatch.sh" with { type: "text" };
-import promptsReadme from "../../backlog/prompts/README.md" with { type: "text" };
-import codeMd from "../../backlog/prompts/code.md" with { type: "text" };
-import reviewMd from "../../backlog/prompts/review.md" with { type: "text" };
-import readyMd from "../../backlog/prompts/ready.md" with { type: "text" };
-import codeTestMd from "../../backlog/prompts/code.test.md" with { type: "text" };
-import reviewTestMd from "../../backlog/prompts/review.test.md" with { type: "text" };
-import readyTestMd from "../../backlog/prompts/ready.test.md" with { type: "text" };
-import tokenReportPs1 from "../../backlog/prompts/token-report.ps1" with { type: "text" };
-import createMrPs1 from "../../backlog/prompts/create-mr.ps1" with { type: "text" };
-import watchdogPs1 from "../../backlog/prompts/watchdog.ps1" with { type: "text" };
 // The MCP configs resolve as parsed JSON (tsc's built-in JSON module typing);
 // re-serialize them when scaffolding. The ${GITLAB_TOKEN} placeholder is a plain
 // string value and round-trips through JSON faithfully.
 import mcpCoderJson from "../../.claude/mcp-coder.json";
 import mcpReviewerJson from "../../.claude/mcp-reviewer.json";
+import cursorMcpJson from "../../.cursor/mcp.json";
+import codeMd from "../../backlog/prompts/code.md" with { type: "text" };
+import codeTestMd from "../../backlog/prompts/code.test.md" with { type: "text" };
+import createMrPs1 from "../../backlog/prompts/create-mr.ps1" with { type: "text" };
+import dispatchPs1 from "../../backlog/prompts/dispatch.ps1" with { type: "text" };
+import dispatchSh from "../../backlog/prompts/dispatch.sh" with { type: "text" };
+import promptsReadme from "../../backlog/prompts/README.md" with { type: "text" };
+import readyMd from "../../backlog/prompts/ready.md" with { type: "text" };
+import readyTestMd from "../../backlog/prompts/ready.test.md" with { type: "text" };
+import reviewMd from "../../backlog/prompts/review.md" with { type: "text" };
+import reviewTestMd from "../../backlog/prompts/review.test.md" with { type: "text" };
+import tokenReportPs1 from "../../backlog/prompts/token-report.ps1" with { type: "text" };
+import watchdogPs1 from "../../backlog/prompts/watchdog.ps1" with { type: "text" };
 
 /**
  * The five-stage pipeline the dispatch loop drives, plus the parking bay it
@@ -88,7 +89,8 @@ export interface ScaffoldFile {
 /**
  * The files init writes into a freshly-initialized project. Prompt/dispatch
  * files live under the chosen backlog directory; the role-scoped MCP configs
- * live under `.claude/`. All are written only when absent so re-init never
+ * live under `.claude/`, and cursor-agent's single workspace config under
+ * `.cursor/`. All are written only when absent so re-init never
  * clobbers a project's customized prompts.
  *
  * `includeClientConfigs` drops the `.claude/` half. Those two files are Claude
@@ -117,6 +119,11 @@ export function buildAgentLoopFiles(backlogDir: string, includeClientConfigs = t
 		files.push(
 			{ path: ".claude/mcp-coder.json", content: `${JSON.stringify(mcpCoderJson, null, 2)}\n` },
 			{ path: ".claude/mcp-reviewer.json", content: `${JSON.stringify(mcpReviewerJson, null, 2)}\n` },
+			// cursor-agent has no --mcp-config flag: it reads .cursor/mcp.json from
+			// the workspace, so there is one config rather than a coder/reviewer
+			// pair. Without this file the agent launches fine and then cannot see
+			// the board at all.
+			{ path: ".cursor/mcp.json", content: `${JSON.stringify(cursorMcpJson, null, 2)}\n` },
 		);
 	}
 	return files;

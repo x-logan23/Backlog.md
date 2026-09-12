@@ -45,7 +45,7 @@ afterEach(() => {
  *   <base>/project/backlog/tasks/<id> - Title.md
  *   <base>/outside/.git                          (an escape target for traversal)
  */
-const makeProject = (frontmatterExtra = "", taskId = "BACK-1") => {
+const makeProject = (frontmatterExtra = "", taskId = "BACK-1", agent = "claude") => {
 	scratchBase = mkdtempSync(join(tmpdir(), "backlog-dispatch-sh-"));
 	const projectRoot = join(scratchBase, "project");
 	const promptsDir = join(projectRoot, "backlog", "prompts");
@@ -66,7 +66,7 @@ const makeProject = (frontmatterExtra = "", taskId = "BACK-1") => {
 	// Filename is lowercase while the id is uppercase — the real-world shape.
 	writeFileSync(
 		join(tasksDir, `${taskId.toLowerCase()} - Sample-task.md`),
-		`---\nid: ${taskId}\ntitle: Sample task\nstatus: In Progress\nassignee: []\ncreated_date: '2026-01-01'\nlabels: []\ndependencies: []\nagent: claude\n${frontmatterExtra}---\n\n## Description\n\nBody.\n`,
+		`---\nid: ${taskId}\ntitle: Sample task\nstatus: In Progress\nassignee: []\ncreated_date: '2026-01-01'\nlabels: []\ndependencies: []\nagent: ${agent}\n${frontmatterExtra}---\n\n## Description\n\nBody.\n`,
 	);
 
 	// macOS puts the temp dir behind the /var -> /private/var symlink, and the
@@ -341,5 +341,116 @@ describe("dispatch.sh — task file lookup", () => {
 		const result = runDispatcher(scratchDispatcher);
 		expect(result.stdout).toContain("(repo: payments-api)");
 		expect(result.stdout).not.toContain("wrong-repo");
+	});
+});
+
+/**
+ * Puts a stub agent binary first on PATH that records the argv it was called
+ * with and whatever arrived on stdin. The dispatcher detaches its launch with
+ * `nohup ... &`, so the capture files appear after the dispatcher has already
+ * exited -- hence waitForFile rather than reading straight after the run.
+ */
+const installStubAgent = (base: string, binaryName: string) => {
+	const stubDir = join(base, "stub-bin");
+	mkdirSync(stubDir, { recursive: true });
+	const argsPath = join(base, `${binaryName}.args`);
+	const stdinPath = join(base, `${binaryName}.stdin`);
+	const stubPath = join(stubDir, binaryName);
+	writeFileSync(
+		stubPath,
+		// Writes to .part and renames, so the files only appear once complete --
+		// `cat > file` creates it empty first, and the test would otherwise read a
+		// file that exists but has not been filled in yet.
+		`#!/bin/sh\n: > "${argsPath}.part"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${argsPath}.part"; done\ncat > "${stdinPath}.part"\nmv "${stdinPath}.part" "${stdinPath}"\nmv "${argsPath}.part" "${argsPath}"\n`,
+		{ mode: 0o755 },
+	);
+	return { stubDir, argsPath, stdinPath };
+};
+
+const waitForFile = (path: string, timeoutMs = 10000): boolean => {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (existsSync(path)) return true;
+		spawnSync("sleep", ["0.05"]);
+	}
+	return existsSync(path);
+};
+
+describe("dispatch.sh — cursor-agent launch", () => {
+	guarded("passes the flags cursor-agent needs and feeds the prompt on stdin", () => {
+		const { scratchDispatcher } = makeProject("", "BACK-1", "cursor-agent");
+		const { stubDir, argsPath, stdinPath } = installStubAgent(String(scratchBase), "cursor-agent");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("binary=cursor-agent");
+
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+
+		// -p is headless. --force also clears the workspace-trust gate, without
+		// which cursor-agent prints a trust notice and exits 0 having done
+		// nothing. --approve-mcps is what makes the backlog MCP reachable.
+		expect(argv).toContain("-p");
+		expect(argv).toContain("--force");
+		expect(argv).toContain("--approve-mcps");
+		// stream-json carries session_id and token usage in the log itself.
+		expect(argv).toContain("--output-format");
+		expect(argv).toContain("stream-json");
+		// claude's flag must never reach cursor-agent: it answers
+		// "error: unknown option" and nothing runs.
+		expect(argv).not.toContain("--dangerously-skip-permissions");
+
+		expect(waitForFile(stdinPath)).toBe(true);
+		expect(readFileSync(stdinPath, "utf8")).toContain("Coder prompt body.");
+	});
+
+	guarded("passes a configured model through as --model", () => {
+		const { projectRoot, scratchDispatcher } = makeProject("", "BACK-1", "cursor-codex");
+		writeFileSync(
+			join(projectRoot, "backlog", "config.yml"),
+			'agents:\n  - alias: "cursor-codex"\n    binary: "cursor-agent"\n    model: "gpt-5.3-codex-high"\n',
+		);
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "cursor-agent");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("binary=cursor-agent");
+
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+		expect(argv).toContain("--model");
+		expect(argv).toContain("gpt-5.3-codex-high");
+	});
+
+	guarded("warns instead of silently dropping an effort cursor-agent cannot take", () => {
+		const { projectRoot, scratchDispatcher } = makeProject("", "BACK-1", "cursor-codex");
+		writeFileSync(
+			join(projectRoot, "backlog", "config.yml"),
+			'agents:\n  - alias: "cursor-codex"\n    binary: "cursor-agent"\n    model: "gpt-5.3-codex"\n    effort: "high"\n',
+		);
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "cursor-agent");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("cursor-agent has no --effort flag");
+
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+		// --effort would be an unknown option; the model still goes through.
+		expect(argv).not.toContain("--effort");
+		expect(argv).toContain("gpt-5.3-codex");
 	});
 });
