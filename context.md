@@ -10,6 +10,195 @@ Written in English to match the code, comments and commit messages;
 
 ---
 
+# Session of 2026-09-11 — CI made real, and the seven failures explained
+
+## Why this session happened
+
+#10 from the previous session was still open. Merging it was supposed to be
+bookkeeping; instead it turned CI on for the first time and immediately produced
+seven failures nobody had an explanation for. The rest of the session was
+explaining them, plus two upstream merges that arrived on top.
+
+## Where things stand
+
+**Merged to `main` (now `4cc8f0a`):**
+
+| PR | what |
+|---|---|
+| #10 | CI lint unblocked + `install:local` re-signs on macOS |
+| #11 | the last `useOptionalChain` finding in `operations.ts` |
+| #12 | the 2026-09-10 session notes |
+| #13 | the seven CI failures — stale expectations, not bugs |
+| #14 | upstream v1.46.0 (task comments) |
+| #15 | upstream v1.46.1 (Codex MCP connection fix) |
+
+**Open: none.** One commit is written but **unpushed** — see `fail-fast` below.
+
+CI on `main` today (run `34659178470`, 1538 tests across 185 files), and this
+is a new sentence for this repo:
+
+| job | result |
+|---|---|
+| `lint-and-unit-test (ubuntu-latest)` | 1529 pass / 9 skip / **0 fail** |
+| `lint-and-unit-test (macos-latest)` | 1529 pass / 9 skip / **0 fail** |
+| `lint-and-unit-test (windows-latest)` | 1511 pass / 26 skip / **1 fail** |
+| `compile-and-smoke-test` ×3 | pass |
+
+`bunx biome lint .` reports **zero** findings — not even the warning #11 cleared.
+
+## 1. The seven Ubuntu failures were the fork's own defaults
+
+This is the thing most worth not re-deriving. All seven had one cause, and it
+was **not** the upstream merges, which is where suspicion naturally lands when
+failures appear right after two of them.
+
+`applyAgentLoopConfigDefaults` (`src/core/init.ts`) provisions the agent loop at
+init: six statuses including `Blocked` (`AGENT_LOOP_STATUSES`) and an
+`onStatusChange` hook pointing at the dispatcher. Upstream ships five statuses
+and no hook. Six tests still asserted the five-status list and one asserted no
+hook at all. **They had been wrong since those defaults landed** — lint failing
+before the test step is the only reason nobody had seen it.
+
+The fix (#13) asserts against `AGENT_LOOP_STATUSES` rather than a literal. The
+literal stays pinned in exactly one place, `agent-loop-statuses.test.ts`, which
+guards the two positions in that order that are load-bearing. Changing the list
+again now updates these call sites instead of breaking them — and keeps the diff
+against future upstream merges small, which matters on a fork that takes
+upstream in batches (two arrived this session alone). One assertion was still expecting
+`| To Do | In Progress | Done |`, a three-status board predating even
+`Human Review`.
+
+**The DoD case needed more care, and is the one to read before touching it.**
+`mcp-definition-of-done-defaults.test.ts` is a *security* regression test: it
+feeds `definition_of_done_defaults_upsert` an item containing a newline and a
+forged `onStatusChange:` key and proves the serializer cannot be tricked into
+injecting a config key. Upstream proved that with `toBeUndefined()` — sound when
+nothing else ever set the hook, meaningless here, **and it would have passed just
+as well if the payload had overwritten a legitimate hook.** It now asserts the
+hook never becomes the payload's, which is the property the test is actually for.
+Anyone "fixing" this back to a simple equality check should read that paragraph
+first.
+
+## 2. Windows reported a test result for the first time, and has exactly one failure
+
+`dispatch.ps1 — Windows status-change dispatcher > multi-line prompt actually
+arrives intact on the spawned child's stdin` (`src/test/dispatch-ps1.test.ts:291`).
+
+The dispatcher exits 0, but the stub `claude.cmd` never writes its capture file
+inside the 10s wait, so `waitForFile` returns false. Seen on three consecutive
+runs — #13, #15, and `main` — always alone, always ~10.7s. **That consistency
+means it is deterministic, not flake.**
+
+It is now the only failing test in the repo on any platform, and it is not
+cosmetic: it guards prompt delivery into the spawned agent, which is the Windows
+half of the loop. Same class of bug as the `${BASH_SOURCE[0]}` dash issue that
+had the POSIX loop dead on Ubuntu for months. Either
+`Start-Process -RedirectStandardInput` genuinely does not deliver on the runner,
+or the detached-process wait is too short for GitHub's Windows I/O.
+
+## 3. Two things the 2026-09-10 notes got wrong
+
+- **The three editor failures are not macOS-specific.** `editTaskInTui` ×2 and
+  `openInEditor` fail on this macOS checkout but **pass on macOS CI**. Whatever
+  causes them is local to the machine, not the platform. The previous session
+  inferred "macOS-specific" from a local run because CI had never reported.
+- **"Seven pre-existing failures" was right about the count and wrong about the
+  cause.** They were read as inherited breakage to be triaged; they were the
+  fork's own divergence, fixable in an afternoon.
+
+Both errors have the same root: local runs were the only evidence available. The
+lesson is narrow and worth keeping — **a failure seen only locally has not been
+attributed to a platform yet.**
+
+## 4. Review of #15 (upstream v1.46.1)
+
+Upstream extracted MCP client setup out of `cli.ts` and `init.ts` into
+`src/utils/mcp-client-setup.ts`. The fork's agent-loop defaults survived intact —
+verified by running a real `backlog init --integration-mode none --defaults` in a
+scratch repo and reading the generated config, not by eyeballing the diff.
+
+One finding was fixed before merge (`6316697`): the new `if (exitCode !== 0) throw`
+turned the documented "re-run `backlog init` to set up MCP" flow into a reported
+failure, because `claude mcp add` exits **1** with `… already exists …` when the
+server is registered. It now matches on the message, so genuine failures still
+surface. **This is upstream's code and the fix belongs upstream** rather than as
+indefinite fork divergence.
+
+Three findings merged unfixed, all small:
+
+1. `mcp-client-setup.ts:35` — `gemini` is still in the positional form without
+   the `--` separator, which is the exact shape this PR declared broken for
+   `codex`. Either it has the same latent failure or Gemini's CLI parses it
+   differently; nobody has checked which.
+2. `build.test.ts:14` — `withTimeout` races but never cancels. On the timeout
+   path the operation stays pending and its later rejection is unhandled, which
+   under `--isolate` can fail the run pointing at an unrelated file.
+3. `MCP_CLIENT_INSTRUCTION_MAP` is duplicated across `cli.ts:120` and
+   `init.ts:68`, and the copies **already differ**: cli.ts's carries
+   `guide: "AGENTS.md"`, init.ts's does not. Behaviour is preserved only because
+   init.ts `continue`s on `guide` first. init.ts's copy is the better one — it is
+   `Record<McpClientSetupKey, …>`, so a new client is a type error rather than a
+   silent `undefined`.
+
+## What is left
+
+1. **`fail-fast: false` is written and cannot be pushed.** The commit is on
+   `ci/no-fail-fast`: `fail-fast: false` on both matrices, YAML verified. GitHub
+   rejects the push — `refusing to allow an OAuth App to create or update
+   workflow .github/workflows/ci.yml without workflow scope`. The `gh` token has
+   `gist, read:org, repo`. Unblock with
+   `gh auth refresh -h github.com -s workflow`. Going through the API does not
+   help; it is gated on the same scope. **This still matters:** on #10's run
+   Ubuntu failed and cancelled macOS and Windows, and the only reason later runs
+   reported all three is that the failing platform happened to finish last.
+2. **The Windows `dispatch.ps1` stdin test** (§2) — the last failing test.
+3. **The three LOW findings from #15** (§4) — one small PR clears all three.
+4. Carried over from 2026-09-10 and still open: the **orange header** design
+   decision (top bar only, or top bar + sidebar); `dispatch.sh` ignoring the
+   role-scoped MCP configs; the `Testing` runner still invoked with the project
+   root rather than the task's repo; per-repo merge requests on Bitbucket.
+
+## Environment facts that cost time this session
+
+- **The `gh` token lacks the `workflow` scope**, so any change under
+  `.github/workflows/` cannot be pushed. Worth knowing *before* writing the
+  commit.
+- **Three commits on `main` are authored `Test User <test@example.com>`**
+  (`6316697`, `518ec88`, `a9dc15f`). The repo-local git identity is clean now
+  (empty local, `Logan` global), so whatever set it has been undone. There is a
+  plausible mechanism in this repo and it is worth checking rather than assuming:
+  `createUniqueTestDir` (`src/test/test-utils.ts:20`) puts every fixture at
+  `join(process.cwd(), "tmp", …)` — **inside the repo** — and dozens of tests then
+  run unqualified `git config user.name "Test User"` with cwd set to that fixture.
+  `git config` without `--local`/`--global` writes to the nearest repo, so a
+  fixture where `git init` has not run or failed sends that write **up into
+  `<repo>/.git/config`**. That is the "the suite does not confine itself to temp
+  fixtures" hazard, one step worse than the file writes already documented.
+  Not fixable retroactively — rewriting shared history is not worth it.
+- **`DEVELOPMENT.md:3` is stale.** It says "Use Bun 1.2.23 … Our CI is pinned to
+  1.2.23 until the upstream fix lands" for the websocket CPU regression
+  (oven-sh/bun#23536). CI is actually on **1.3.11** (`ci.yml:14`) and this machine
+  runs **1.4.0**. The pin moved with an upstream merge and the doc did not follow.
+  Either the regression is fixed and the note should go, or the pin is wrong —
+  it affects `backlog browser`, so it is worth resolving.
+- **`bun run lint` is `biome lint --write .`**, and `--write` silently applies
+  *safe* fixes before reporting. That is why CI said "Found 1 error" while a
+  read-only `biome lint .` locally showed two: the second was being auto-fixed in
+  the runner's working copy and committed nowhere.
+- **The theme lives on the hub, not here.** `~/code/backlog/config.yml` carried
+  `theme: "bankaya-light"`; `backlog config set theme ""` run from `~/code`
+  removes the key entirely, which is the documented default-look state. Verified
+  from the running server (`GET /theme.css` → 200, 0 bytes), not just the file.
+  The three theme files in `~/code/backlog/themes/` are untouched.
+- **Local `main` goes stale fast** when PRs are merged from the GitHub UI. A
+  review scoped with `main...HEAD` against a stale `main` reviewed 45 files
+  instead of 7. Use `origin/main...HEAD`, or fetch first.
+- **The full suite runs in ~120s locally** and wrote nothing into `backlog/` on
+  this session's runs — but check `git status` after `bun test` anyway; the
+  previous session documented it promoting a draft into a real task.
+
+---
+
 # Session of 2026-09-10 — multi-repo dispatch, web theming, CI
 
 ## Why this session happened
