@@ -8,6 +8,200 @@ be wrong in it, and what is left.
 Written in English to match the code, comments and commit messages;
 `FORK_CONTEXT.md` is in Spanish and stays that way.
 
+**What belongs here, and what does not.** This is a public fork of someone
+else's tool, so this file records findings that are true for *any* user of it:
+bugs, CI behaviour, dispatcher semantics, traps worth not re-hitting. Anything
+that only makes sense for one particular deployment — a company or project name,
+brand assets and palettes, account or model policy, machine paths, which repos
+exist — belongs in that deployment's own context file, kept outside this
+repository. When a finding has both halves, write the general rule here and leave
+the specifics there.
+
+---
+
+# Session of 2026-09-12 — cursor-agent, and running the loop on other models
+
+## Why this session happened
+
+The loop only ever ran Claude. The deployment has Cursor, whose CLI reaches GPT-5.3
+Codex, Grok, Gemini, Composer and Claude from one binary, so the question was
+what it takes to dispatch something other than `claude` — and the answer turned
+out to be small, because the dispatcher was already built for it.
+
+## Where things stand
+
+**Merged:** #16 (the 09-11 notes), #17 (upstream v1.47.0, CLI-first agent
+workflow), #18 (cursor-agent support).
+**Open:** #19 — `fail-fast: false`, finally pushable (see below).
+
+## 1. The dispatcher was already an agent table
+
+Worth knowing before touching it: `dispatch.sh` already resolved a per-task
+`agent:` / `reviewAgent:` through an `agents:` alias block in `config.yml`
+(`alias` → `binary` / `model` / `effort`) to a `case "$agent_binary"`. Adding
+Cursor was a new branch in that `case`, not new architecture.
+
+**The `*` fallback would not have covered it.** It passes
+`--dangerously-skip-permissions` and assumes claude-compatible stdin;
+cursor-agent answers `error: unknown option`. Anything that is not
+claude-shaped needs its own arm.
+
+## 2. cursor-agent maps onto claude almost 1:1
+
+| need | claude | cursor-agent |
+|---|---|---|
+| headless | `-p` | `-p` (same flag) |
+| prompt | stdin | stdin |
+| skip permissions | `--dangerously-skip-permissions` | `--force` / `--yolo` |
+| model | `--model X` | `--model X` |
+| effort | `--effort X` | bracket syntax **inside** the model string |
+| resume | `--resume <id>` | `--resume <id>` |
+| session id | scrape `~/.claude/projects/**.jsonl` | `session_id` in the JSON result |
+| token usage | scrape the transcript | `usage` in the JSON result |
+| live feed | nothing from `-p` | `--output-format stream-json` |
+| MCP | `--mcp-config <file>` | `.cursor/mcp.json` in the workspace |
+
+Session ids are UUIDs, so the dispatcher's existing regex already matched.
+
+**`--output-format stream-json` is strictly better than what claude gives us.**
+It emits NDJSON — `system/init`, `thinking/delta`, `assistant`,
+`tool_call/started`, `tool_call/completed`, `result/success` — straight into the
+dispatch log, with `session_id` and token counts in the final event. That is a
+first-class feed for the live agent panel, unlike claude's plain `-p`, which per
+the 09-02 notes forced the panel to read the session transcript instead.
+
+## 3. Four things that break the loop silently
+
+Each of these would pass a code review and fail in production:
+
+- **`--force` is not only about permissions.** It also clears the
+  workspace-trust gate. Without it cursor-agent prints a trust notice and
+  **exits 0 having done nothing** — the same signature as the
+  `${BASH_SOURCE[0]}` bashism that left the POSIX loop dead on Ubuntu for
+  months. A dispatch that looks healthy and never ran an agent.
+- **`--approve-mcps` is required**, or the backlog server stays
+  `not loaded (needs approval)` and the agent cannot see the board it was
+  dispatched to work on.
+- **There is no `--mcp-config` flag.** Cursor reads `.cursor/mcp.json` from the
+  workspace, which `init` now scaffolds. The consequence is a real capability
+  loss worth stating: **the coder/reviewer MCP split that
+  `.claude/mcp-{coder,reviewer}.json` gives Claude is not expressible for
+  Cursor.** Both roles get the same servers.
+- **There is no `--effort` flag.** Cursor carries effort inside the model string
+  (`model: "claude-opus-4-8[context=1m,effort=high]"`). The model/effort block
+  is no longer claude-only, and an `effort:` on a cursor alias now **warns**
+  rather than being dropped — a config that looks honoured and is not is the
+  failure this repo keeps re-learning.
+
+## 4. Verified by running it, not by reading it
+
+A real dispatch in a scratch project launched cursor-agent on `gpt-5.3-codex`,
+which called the Backlog MCP and moved the task to In Review — **and the loop
+then chained on its own**, firing the reviewer, which sent it back to In
+Progress. Two dispatch logs, both with `result/success`, `session_id` and token
+counts, and the live process argv confirmed the flags.
+
+This mattered: the trust gate and the MCP approval were both discovered by
+running it, and neither shows up in `--help` as a problem.
+
+The three tests use a stub binary on PATH. **The stub writes to `.part` and
+renames**, because `cat > file` creates it empty first and the test otherwise
+reads a file that exists but is not filled in yet — that actually failed once
+before being fixed, and it is the same race that the Windows `dispatch.ps1`
+stdin test is still losing.
+
+## 5. ZDR, and where company policy belongs
+
+`cursor-agent --list-models` labels **20 of 223** entries `(NO ZDR)`. All 20 are
+one family — `claude-fable-5*` and `claude-fable-5-1*` across every effort tier.
+Nothing else is flagged: Sonnet (16 variants), Opus, Codex, Grok, Gemini and
+Composer are all clean. The local client state (`~/.cursor/cli-config.json`)
+shows ghost mode on and a non-zero privacy mode on a team account, which together
+with the labelling convention indicates ZDR is the baseline — but **what the
+client labels is not what the contract guarantees**, and the authoritative source
+is the Cursor admin console, not the CLI.
+
+The deployment avoids that family. **A guard for it was proposed and rejected, correctly:**
+this fork is a public tool, and a hardcoded `claude-fable-5*` block would impose
+one company's compliance decision on every user's dispatcher. Shipped code stays
+a neutral mechanism; the policy lives in the hub config where the aliases are
+defined, which is the same line that keeps brand hexes and the company name out
+of the fork. If a guard is ever genuinely needed, the upstream-appropriate shape
+is a user-supplied denylist in config — not a hardcoded family name, and not
+before something actually goes wrong.
+
+## 6. The hub was running a stale dispatcher
+
+The hub's `backlog/prompts/dispatch.sh` was the **Sep 10** copy: `set -euo pipefail`
+on line 12 and `${BASH_SOURCE[0]}` on line 14, i.e. both bugs #10 fixed. Harmless
+on that Mac because `/bin/sh` is bash, and dead on Linux. Replaced by hand
+(backup at `dispatch.sh.bak-20260912`).
+
+**Re-running `backlog init` would not have fixed it.** `scaffoldAgentLoopFiles`
+writes each file only when absent, deliberately, so it never clobbers customized
+prompts — which means **updating a hub's dispatcher is always a manual copy**,
+even after `install:local`. Worth remembering before assuming a project has the
+dispatcher fixes it appears to have.
+
+The hub now runs both agents, verified by dispatching with stub binaries on PATH
+so no tokens were spent:
+
+```yaml
+agents:
+  - alias: "claude"
+    binary: "claude"
+    model: "sonnet"
+  - alias: "cursor-gpt"
+    binary: "cursor-agent"
+    model: "gpt-5.3-codex-high"
+```
+
+No role convention is baked in — each task names its own `agent:` and
+`reviewAgent:`. Note a task with **no** `agent:` field is treated as a human task
+and never dispatches, so both fields must be set on anything the loop should pick
+up. The hub's `.cursor/mcp.json` was created by hand, since the installed binary
+predates the scaffold change.
+
+## 7. `fail-fast` is unblocked
+
+The commit the 09-11 notes recorded as unpushable is now **#19**. The `gh` token
+was missing the `workflow` scope; `gh auth refresh -h github.com -s workflow`
+granted it and the push went through unchanged.
+
+## What is left
+
+1. **The Windows `dispatch.ps1` stdin test** — still the only failing test in the
+   repo on any platform, deterministic across every run this week. Note §4: the
+   POSIX stub test hit the same create-empty-then-fill race and fixing it needed
+   an atomic rename, which is worth trying on the Windows side.
+2. **`dispatch.ps1` has no cursor-agent branch.** Deliberate — cursor-agent ships
+   on Windows, but #18 could only be tested on macOS, and the precedent is to
+   leave the untestable half alone rather than write it blind.
+3. **Three LOW findings from the #15 review**, still unfixed: the Gemini `--`
+   separator, `withTimeout` not cancelling in `build.test.ts`, and
+   `MCP_CLIENT_INSTRUCTION_MAP` duplicated across `cli.ts` and `init.ts`.
+4. Carried over: the **orange header** decision; `dispatch.sh` ignoring the
+   role-scoped MCP configs (and now known to be unfixable for Cursor);
+   the `Testing` runner still invoked with the project root; per-repo merge
+   requests on a non-GitLab host.
+
+## Environment facts that cost time this session
+
+- **`--list-models` output is long (223 entries) and must not be judged from the
+  first screen.** An early read of the first 30 lines gave "two Fable models are
+  NO ZDR"; the real answer is 20 entries, all one family. Count before asserting.
+- **`biome check --write src/` reformats files you never touched** — nine of them
+  here (`init.ts`, `task-hook-dispatcher.ts`, `board-config-merge.ts`,
+  `useAgentActivity.ts` and others), all pre-existing line-width drift. Revert
+  them or the diff stops being about your change.
+- **`timeout` is not on this Mac** (GNU coreutils is not installed), so shell
+  probes need their own polling loop rather than `timeout N cmd`.
+- **`claude --model sonnet` takes an alias**, not just a full model id.
+- **Upstream v1.47.0 rewrote the `CLAUDE.md` guidelines block** to a CLI-first
+  form telling agents to run `backlog instructions overview` and to track work as
+  tasks. The standing instruction for this repo is still that its board is demo
+  data and sessions should not create tasks in it.
+
 ---
 
 # Session of 2026-09-11 — CI made real, and the seven failures explained
@@ -156,7 +350,7 @@ Three findings merged unfixed, all small:
 4. Carried over from 2026-09-10 and still open: the **orange header** design
    decision (top bar only, or top bar + sidebar); `dispatch.sh` ignoring the
    role-scoped MCP configs; the `Testing` runner still invoked with the project
-   root rather than the task's repo; per-repo merge requests on Bitbucket.
+   root rather than the task's repo; per-repo merge requests on a non-GitLab host.
 
 ## Environment facts that cost time this session
 
@@ -185,11 +379,11 @@ Three findings merged unfixed, all small:
   *safe* fixes before reporting. That is why CI said "Found 1 error" while a
   read-only `biome lint .` locally showed two: the second was being auto-fixed in
   the runner's working copy and committed nowhere.
-- **The theme lives on the hub, not here.** `~/code/backlog/config.yml` carried
-  `theme: "bankaya-light"`; `backlog config set theme ""` run from `~/code`
+- **The theme lives on the hub, not here.** The hub's `backlog/config.yml` carried
+  a project theme; `backlog config set theme ""` run from the hub
   removes the key entirely, which is the documented default-look state. Verified
   from the running server (`GET /theme.css` → 200, 0 bytes), not just the file.
-  The three theme files in `~/code/backlog/themes/` are untouched.
+  The theme files in the hub are untouched.
 - **Local `main` goes stale fast** when PRs are merged from the GitHub UI. A
   review scoped with `main...HEAD` against a stale `main` reviewed 45 files
   instead of 7. Use `origin/main...HEAD`, or fetch first.
@@ -203,7 +397,7 @@ Three findings merged unfixed, all small:
 
 ## Why this session happened
 
-The fork is now used at Bankaya, a microservices shop: many small repos cloned
+The fork is now used at a microservices shop: many small repos cloned
 side by side, no monorepo. Running `backlog init` in each would scatter task
 state across N repos and fragment the board. The goal was one hub backlog above
 the repos, with each task naming the repo it targets, and the dispatcher running
@@ -294,7 +488,7 @@ A Windows review caught two real holes:
    macOS and Windows results stay invisible.
 3. **The orange header — the open design decision.** Three theme variants exist
    and the palette work has gone about as far as it can. What actually makes
-   bankaya.com.mx recognisable is a **solid orange header bar**, and a theme
+   that deployment's brand recognisable is a **solid coloured header bar**, and a theme
    cannot produce it: the header and sidebar are painted with `bg-gray-100` /
    `dark:bg-gray-800`, the *same tokens* as cards, chips and hover states, so
    overriding them colours everything. Needs a component change (~20 lines in
@@ -309,21 +503,20 @@ A Windows review caught two real holes:
 5. **The opt-in `Testing` runner** is still invoked with the project root, not
    the task's repo.
 6. **Per-repo merge requests.** `create-mr.ps1` takes a single
-   `GITLAB_PROJECT_ID`; Bankaya is on **Bitbucket**. Either the reviewer agent
+   `GITLAB_PROJECT_ID`; not every deployment is on GitLab. Either the reviewer agent
    opens PRs via MCP, or a per-repo variant is needed.
 
 ## Environment facts that cost time this session
 
-- **The hub lives at `~/code`**, outside this repo, created with
+- **The hub lives one directory above the repos**, outside this repo, created with
   `backlog init --no-git` (filesystem-only). Prefix `bnk`, full agent-loop
   statuses, `shell: auto`, POSIX dispatcher. The five service repos and this
-  repo are siblings under it. `~/code/Backlog.md` keeps its own backlog —
+  repo are siblings under it. The fork checkout keeps its own backlog —
   verified that root resolution picks the nearest, so the two do not collide.
-- **Theme files are in `~/code/backlog/themes/`, deliberately not in this repo**
+- **Theme files live in the hub's `backlog/themes/`, deliberately not in this repo**
   — brand hexes plus the company name do not belong in a public fork. Three
-  variants: `bankaya` (navy neutrals, dark-first), `bankaya-warm` (warm charcoal
-  surfaces — the one that finally read as orange), `bankaya-light` (cool
-  neutrals, light-first, currently active).
+  variants were tried: navy neutrals dark-first, warm charcoal surfaces (the one
+  that finally read as branded), and cool neutrals light-first.
 - **The grey ramp does two unrelated jobs**, and missing this is what made the
   first theme look blue: in light mode its dark steps are *text*
   (`text-gray-900` ×157), in dark mode the same steps are *surfaces*
@@ -338,15 +531,16 @@ A Windows review caught two real holes:
   `install:local` reach it.
 - **git remote is HTTPS**, not SSH: the ed25519 key is not on the GitHub
   account, and `gh auth login` was done with the HTTPS protocol. `gh` is
-  installed. Bitbucket uses a separate key and is unaffected.
-- **`Bankaya_2022_short brandbook.pdf` sits in this repo's working tree** and is
-  excluded only via `.git/info/exclude` (local, not committed). The remote is a
-  **public** fork, so one `git add -A` would publish it. It should be moved out
-  of the repo; an exclude protects this clone only.
-- The brandbook palette, for reference: Naranja `#FE411A`, Rosa `#FB2048`,
-  Azul `#2364E6`, White Pearl `#F0F2F9`, Black blue `#101239`. Azul converts to
-  almost exactly Tailwind's `blue-600`, so the stock UI was already on-brand for
-  blue.
+  installed. Other hosts may use a separate key and are unaffected.
+- **Keep private binaries and brand assets out of the working tree entirely.**
+  A `.git/info/exclude` entry protects one clone and nothing else, and it is easy
+  to lose. On a public fork, one `git add -A` publishes whatever is sitting
+  there. Park them in the project-local directory instead (see the note at the
+  top of this file).
+- A brand palette often already overlaps Tailwind's defaults — check before
+  overriding. In one case the brand blue converted to almost exactly `blue-600`,
+  so the stock UI was already on-brand for that colour and only the neutrals
+  needed work.
 
 ---
 
@@ -417,7 +611,7 @@ the totals `tokensPartial` rather than reporting a confident wrong number.
 
 `/api/agent-status` decided "running" from `process.kill(pid, 0)` alone. Windows
 recycles PIDs and the `.pid` files outlive their agents by days. Measured
-2026-09-02 on the kiero-app project — all four "running" dispatches:
+2026-09-02 on a downstream project — all four "running" dispatches:
 
 | PID | actually was | started | dispatch was |
 |---|---|---|---|
@@ -435,7 +629,7 @@ three states, shared by the card badges and the panel so they cannot disagree.
 stranded-session signature, and calling it "done" hides the one case needing a
 human.
 
-> `project_state.md` rev 38 (kiero-app memory) lists "the agent dashboard reports
+> That project's own notes list "the agent dashboard reports
 > false strandings" as an open failure mode. **That is this bug, and it is fixed
 > here** — but only once this branch ships.
 
@@ -534,7 +728,7 @@ Two traps worth remembering, both already hit:
 ### 7. Fenced tasks read as `hop 7/6`
 
 **The panel has now been reviewed in a browser by a person** (2026-09-07, on the
-kiero-app board) and the layout is confirmed. That review found one thing.
+a downstream board) and the layout is confirmed. That review found one thing.
 
 `dispatch.ps1` claims one hop file *beyond* the cap as a sentinel and then
 refuses — the loop runs to `$maxRoundTrips + 1`, and `$trips -gt $maxRoundTrips`
@@ -679,7 +873,7 @@ the dispatcher and exits cleanly rather than doing anything surprising.
   HEAD too**: the repo stores LF, Windows checks out CRLF. Pre-existing; do not
   "fix" it with a reformat. Note biome's `files.includes` is `src/**/*.ts` — it
   does **not** cover `.tsx`.
-- **Never start a second `backlog browser` against the kiero-app project while its
+- **Never start a second `backlog browser` against a project while its
   loop is live.** Multiple servers each firing `onStatusChange` is the documented
   17-fires-for-one-change storm. Test against a scratch fixture instead.
 
