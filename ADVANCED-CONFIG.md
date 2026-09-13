@@ -62,7 +62,7 @@ Running `backlog config` with no arguments launches the interactive advanced wiz
 The browser interface ships with one look, and `theme` replaces its colors without touching any component or rebuilding anything.
 
 ```bash
-backlog config set theme bankaya     # loads backlog/themes/bankaya.css
+backlog config set theme midnight    # loads backlog/themes/midnight.css
 backlog config set theme ""          # back to the default look
 ```
 
@@ -71,7 +71,7 @@ Every Tailwind utility in the UI compiles to a CSS custom property — `.bg-gray
 Create `backlog/themes/<name>.css`:
 
 ```css
-/* backlog/themes/bankaya.css */
+/* backlog/themes/midnight.css */
 :root {
   /* Brand primary. Used by buttons, links, focus rings and the active nav item. */
   --color-blue-600: #0a3d62;

@@ -8,13 +8,22 @@ be wrong in it, and what is left.
 Written in English to match the code, comments and commit messages;
 `FORK_CONTEXT.md` is in Spanish and stays that way.
 
+**What belongs here, and what does not.** This is a public fork of someone
+else's tool, so this file records findings that are true for *any* user of it:
+bugs, CI behaviour, dispatcher semantics, traps worth not re-hitting. Anything
+that only makes sense for one particular deployment — a company or project name,
+brand assets and palettes, account or model policy, machine paths, which repos
+exist — belongs in that deployment's own context file, kept outside this
+repository. When a finding has both halves, write the general rule here and leave
+the specifics there.
+
 ---
 
 # Session of 2026-09-12 — cursor-agent, and running the loop on other models
 
 ## Why this session happened
 
-The loop only ever ran Claude. Bankaya has Cursor, whose CLI reaches GPT-5.3
+The loop only ever ran Claude. The deployment has Cursor, whose CLI reaches GPT-5.3
 Codex, Grok, Gemini, Composer and Claude from one binary, so the question was
 what it takes to dispatch something other than `claude` — and the answer turned
 out to be small, because the dispatcher was already built for it.
@@ -112,7 +121,7 @@ with the labelling convention indicates ZDR is the baseline — but **what the
 client labels is not what the contract guarantees**, and the authoritative source
 is the Cursor admin console, not the CLI.
 
-Bankaya avoids Fable 5. **A guard for that was proposed and rejected, correctly:**
+The deployment avoids that family. **A guard for it was proposed and rejected, correctly:**
 this fork is a public tool, and a hardcoded `claude-fable-5*` block would impose
 one company's compliance decision on every user's dispatcher. Shipped code stays
 a neutral mechanism; the policy lives in the hub config where the aliases are
@@ -123,7 +132,7 @@ before something actually goes wrong.
 
 ## 6. The hub was running a stale dispatcher
 
-`~/code/backlog/prompts/dispatch.sh` was the **Sep 10** copy: `set -euo pipefail`
+The hub's `backlog/prompts/dispatch.sh` was the **Sep 10** copy: `set -euo pipefail`
 on line 12 and `${BASH_SOURCE[0]}` on line 14, i.e. both bugs #10 fixed. Harmless
 on that Mac because `/bin/sh` is bash, and dead on Linux. Replaced by hand
 (backup at `dispatch.sh.bak-20260912`).
@@ -150,7 +159,7 @@ agents:
 No role convention is baked in — each task names its own `agent:` and
 `reviewAgent:`. Note a task with **no** `agent:` field is treated as a human task
 and never dispatches, so both fields must be set on anything the loop should pick
-up. `~/code/.cursor/mcp.json` was created by hand, since the installed binary
+up. The hub's `.cursor/mcp.json` was created by hand, since the installed binary
 predates the scaffold change.
 
 ## 7. `fail-fast` is unblocked
@@ -174,7 +183,7 @@ granted it and the push went through unchanged.
 4. Carried over: the **orange header** decision; `dispatch.sh` ignoring the
    role-scoped MCP configs (and now known to be unfixable for Cursor);
    the `Testing` runner still invoked with the project root; per-repo merge
-   requests on Bitbucket.
+   requests on a non-GitLab host.
 
 ## Environment facts that cost time this session
 
@@ -341,7 +350,7 @@ Three findings merged unfixed, all small:
 4. Carried over from 2026-09-10 and still open: the **orange header** design
    decision (top bar only, or top bar + sidebar); `dispatch.sh` ignoring the
    role-scoped MCP configs; the `Testing` runner still invoked with the project
-   root rather than the task's repo; per-repo merge requests on Bitbucket.
+   root rather than the task's repo; per-repo merge requests on a non-GitLab host.
 
 ## Environment facts that cost time this session
 
@@ -370,11 +379,11 @@ Three findings merged unfixed, all small:
   *safe* fixes before reporting. That is why CI said "Found 1 error" while a
   read-only `biome lint .` locally showed two: the second was being auto-fixed in
   the runner's working copy and committed nowhere.
-- **The theme lives on the hub, not here.** `~/code/backlog/config.yml` carried
-  `theme: "bankaya-light"`; `backlog config set theme ""` run from `~/code`
+- **The theme lives on the hub, not here.** The hub's `backlog/config.yml` carried
+  a project theme; `backlog config set theme ""` run from the hub
   removes the key entirely, which is the documented default-look state. Verified
   from the running server (`GET /theme.css` → 200, 0 bytes), not just the file.
-  The three theme files in `~/code/backlog/themes/` are untouched.
+  The theme files in the hub are untouched.
 - **Local `main` goes stale fast** when PRs are merged from the GitHub UI. A
   review scoped with `main...HEAD` against a stale `main` reviewed 45 files
   instead of 7. Use `origin/main...HEAD`, or fetch first.
@@ -388,7 +397,7 @@ Three findings merged unfixed, all small:
 
 ## Why this session happened
 
-The fork is now used at Bankaya, a microservices shop: many small repos cloned
+The fork is now used at a microservices shop: many small repos cloned
 side by side, no monorepo. Running `backlog init` in each would scatter task
 state across N repos and fragment the board. The goal was one hub backlog above
 the repos, with each task naming the repo it targets, and the dispatcher running
@@ -479,7 +488,7 @@ A Windows review caught two real holes:
    macOS and Windows results stay invisible.
 3. **The orange header — the open design decision.** Three theme variants exist
    and the palette work has gone about as far as it can. What actually makes
-   bankaya.com.mx recognisable is a **solid orange header bar**, and a theme
+   that deployment's brand recognisable is a **solid coloured header bar**, and a theme
    cannot produce it: the header and sidebar are painted with `bg-gray-100` /
    `dark:bg-gray-800`, the *same tokens* as cards, chips and hover states, so
    overriding them colours everything. Needs a component change (~20 lines in
@@ -494,21 +503,20 @@ A Windows review caught two real holes:
 5. **The opt-in `Testing` runner** is still invoked with the project root, not
    the task's repo.
 6. **Per-repo merge requests.** `create-mr.ps1` takes a single
-   `GITLAB_PROJECT_ID`; Bankaya is on **Bitbucket**. Either the reviewer agent
+   `GITLAB_PROJECT_ID`; not every deployment is on GitLab. Either the reviewer agent
    opens PRs via MCP, or a per-repo variant is needed.
 
 ## Environment facts that cost time this session
 
-- **The hub lives at `~/code`**, outside this repo, created with
+- **The hub lives one directory above the repos**, outside this repo, created with
   `backlog init --no-git` (filesystem-only). Prefix `bnk`, full agent-loop
   statuses, `shell: auto`, POSIX dispatcher. The five service repos and this
-  repo are siblings under it. `~/code/Backlog.md` keeps its own backlog —
+  repo are siblings under it. The fork checkout keeps its own backlog —
   verified that root resolution picks the nearest, so the two do not collide.
-- **Theme files are in `~/code/backlog/themes/`, deliberately not in this repo**
+- **Theme files live in the hub's `backlog/themes/`, deliberately not in this repo**
   — brand hexes plus the company name do not belong in a public fork. Three
-  variants: `bankaya` (navy neutrals, dark-first), `bankaya-warm` (warm charcoal
-  surfaces — the one that finally read as orange), `bankaya-light` (cool
-  neutrals, light-first, currently active).
+  variants were tried: navy neutrals dark-first, warm charcoal surfaces (the one
+  that finally read as branded), and cool neutrals light-first.
 - **The grey ramp does two unrelated jobs**, and missing this is what made the
   first theme look blue: in light mode its dark steps are *text*
   (`text-gray-900` ×157), in dark mode the same steps are *surfaces*
@@ -523,15 +531,16 @@ A Windows review caught two real holes:
   `install:local` reach it.
 - **git remote is HTTPS**, not SSH: the ed25519 key is not on the GitHub
   account, and `gh auth login` was done with the HTTPS protocol. `gh` is
-  installed. Bitbucket uses a separate key and is unaffected.
-- **`Bankaya_2022_short brandbook.pdf` sits in this repo's working tree** and is
-  excluded only via `.git/info/exclude` (local, not committed). The remote is a
-  **public** fork, so one `git add -A` would publish it. It should be moved out
-  of the repo; an exclude protects this clone only.
-- The brandbook palette, for reference: Naranja `#FE411A`, Rosa `#FB2048`,
-  Azul `#2364E6`, White Pearl `#F0F2F9`, Black blue `#101239`. Azul converts to
-  almost exactly Tailwind's `blue-600`, so the stock UI was already on-brand for
-  blue.
+  installed. Other hosts may use a separate key and are unaffected.
+- **Keep private binaries and brand assets out of the working tree entirely.**
+  A `.git/info/exclude` entry protects one clone and nothing else, and it is easy
+  to lose. On a public fork, one `git add -A` publishes whatever is sitting
+  there. Park them in the project-local directory instead (see the note at the
+  top of this file).
+- A brand palette often already overlaps Tailwind's defaults — check before
+  overriding. In one case the brand blue converted to almost exactly `blue-600`,
+  so the stock UI was already on-brand for that colour and only the neutrals
+  needed work.
 
 ---
 
@@ -602,7 +611,7 @@ the totals `tokensPartial` rather than reporting a confident wrong number.
 
 `/api/agent-status` decided "running" from `process.kill(pid, 0)` alone. Windows
 recycles PIDs and the `.pid` files outlive their agents by days. Measured
-2026-09-02 on the kiero-app project — all four "running" dispatches:
+2026-09-02 on a downstream project — all four "running" dispatches:
 
 | PID | actually was | started | dispatch was |
 |---|---|---|---|
@@ -620,7 +629,7 @@ three states, shared by the card badges and the panel so they cannot disagree.
 stranded-session signature, and calling it "done" hides the one case needing a
 human.
 
-> `project_state.md` rev 38 (kiero-app memory) lists "the agent dashboard reports
+> That project's own notes list "the agent dashboard reports
 > false strandings" as an open failure mode. **That is this bug, and it is fixed
 > here** — but only once this branch ships.
 
@@ -719,7 +728,7 @@ Two traps worth remembering, both already hit:
 ### 7. Fenced tasks read as `hop 7/6`
 
 **The panel has now been reviewed in a browser by a person** (2026-09-07, on the
-kiero-app board) and the layout is confirmed. That review found one thing.
+a downstream board) and the layout is confirmed. That review found one thing.
 
 `dispatch.ps1` claims one hop file *beyond* the cap as a sentinel and then
 refuses — the loop runs to `$maxRoundTrips + 1`, and `$trips -gt $maxRoundTrips`
@@ -864,7 +873,7 @@ the dispatcher and exits cleanly rather than doing anything surprising.
   HEAD too**: the repo stores LF, Windows checks out CRLF. Pre-existing; do not
   "fix" it with a reformat. Note biome's `files.includes` is `src/**/*.ts` — it
   does **not** cover `.tsx`.
-- **Never start a second `backlog browser` against the kiero-app project while its
+- **Never start a second `backlog browser` against a project while its
   loop is live.** Multiple servers each firing `onStatusChange` is the documented
   17-fires-for-one-change storm. Test against a scratch fixture instead.
 

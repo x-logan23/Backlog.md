@@ -30,9 +30,9 @@ describe("theme config round trip", () => {
 	});
 
 	it("persists a theme name and reads it back", async () => {
-		await filesystem.saveConfig({ ...BASE_CONFIG, theme: "bankaya" });
+		await filesystem.saveConfig({ ...BASE_CONFIG, theme: "midnight" });
 		filesystem.invalidateConfigCache();
-		expect((await filesystem.loadConfig())?.theme).toBe("bankaya");
+		expect((await filesystem.loadConfig())?.theme).toBe("midnight");
 	});
 
 	it("writes no theme key when none is set", async () => {
@@ -47,12 +47,12 @@ describe("theme config round trip", () => {
 		// The config writer serializes from the typed object, so a field that
 		// round-trips only by luck would be dropped the first time anything
 		// else is saved.
-		await filesystem.saveConfig({ ...BASE_CONFIG, theme: "bankaya" });
+		await filesystem.saveConfig({ ...BASE_CONFIG, theme: "midnight" });
 		filesystem.invalidateConfigCache();
 		const loaded = await filesystem.loadConfig();
 		await filesystem.saveConfig({ ...(loaded as BacklogConfig), maxColumnWidth: 25 });
 		filesystem.invalidateConfigCache();
-		expect((await filesystem.loadConfig())?.theme).toBe("bankaya");
+		expect((await filesystem.loadConfig())?.theme).toBe("midnight");
 	});
 });
 
@@ -121,8 +121,8 @@ describe("GET /theme.css", () => {
 	});
 
 	it("serves the configured theme file", async () => {
-		await writeTheme("bankaya", ":root{--color-blue-600:#0a3d62}");
-		await startServer({ ...BASE_CONFIG, theme: "bankaya" });
+		await writeTheme("midnight", ":root{--color-blue-600:#0a3d62}");
+		await startServer({ ...BASE_CONFIG, theme: "midnight" });
 		const res = await fetchTheme();
 		expect(res.status).toBe(200);
 		expect(res.headers.get("content-type")).toContain("text/css");
@@ -147,8 +147,8 @@ describe("GET /theme.css", () => {
 	});
 
 	it("is served with no-store headers so an edited palette shows on reload", async () => {
-		await writeTheme("bankaya", ":root{--color-gray-50:#fff}");
-		await startServer({ ...BASE_CONFIG, theme: "bankaya" });
+		await writeTheme("midnight", ":root{--color-gray-50:#fff}");
+		await startServer({ ...BASE_CONFIG, theme: "midnight" });
 		const res = await fetchTheme();
 		expect(res.headers.get("cache-control")).toContain("no-store");
 	});
