@@ -204,6 +204,90 @@ If the log is empty after a status change, check:
 - That `shell` in `backlog.config.yml` matches an installed interpreter (Settings → Status Change Callback in the browser will flag missing shells).
 - That the prompt file the dispatcher chose actually exists (`code.md` / `review.md` / `ready.md`).
 
+## Choosing an agent per task
+
+The `agents:` block maps an alias to a `(binary, model, effort)` triple, and a
+task picks one with `agent:` / `reviewAgent:`. Two things are worth getting right
+before you write a long list of aliases.
+
+**Name aliases for capability, not for role.** A "deep coder" and a "deep
+reviewer" are the *same* triple — the role comes from whether the alias lands in
+`agent:` or `reviewAgent:`, not from its name. Role-named aliases duplicate each
+other and then drift apart. Tiers stay honest:
+
+```yaml
+agents:
+  # Mechanical work: renames, version bumps, formatting, codemods -- a known
+  # shape, no judgement. A small fast model is enough, but it still has to drive
+  # the Backlog MCP to move its own task, so test the one you pick (see below).
+  - alias: "mech"
+    binary: "cursor-agent"
+    model: "composer-2.5-fast"
+
+  # Claude Code: effort is its own flag (low|medium|high|xhigh|max).
+  - alias: "claude-quick"
+    binary: "claude"
+    model: "sonnet"
+    effort: "low"
+  - alias: "claude"
+    binary: "claude"
+    model: "sonnet"
+    effort: "medium"
+  - alias: "claude-deep"
+    binary: "claude"
+    model: "sonnet"
+    effort: "high"
+
+  # cursor-agent: no --effort flag, so the tier lives in the model id.
+  - alias: "gpt-quick"
+    binary: "cursor-agent"
+    model: "gpt-5.3-codex-low-fast"
+  - alias: "gpt"
+    binary: "cursor-agent"
+    model: "gpt-5.3-codex"
+  - alias: "gpt-deep"
+    binary: "cursor-agent"
+    model: "gpt-5.3-codex-xhigh"
+```
+
+Model ids above are examples from one account — substitute what yours can reach
+(`cursor-agent --list-models`, or your Claude Code plan's models).
+
+**Pair across model families.** A reviewer that shares the coder's blind spots is
+a weak reviewer: it tends to accept the same wrong assumption that produced the
+code. Running the two roles on different families is most of the value of having
+more than one agent binary configured.
+
+| task shape | `agent:` | `reviewAgent:` |
+|---|---|---|
+| mechanical (rename, bump, format) | `mech` | `gpt-quick` |
+| simple feature or bugfix | `claude` | `gpt` |
+| complex or multi-file | `claude-deep` | `gpt-deep` |
+| the other family implements | `gpt` | `claude-deep` |
+| risky (auth, money, migrations) | `claude-deep` | `gpt-deep` |
+
+**Give the reviewer at least the coder's effort.** A reviewer missing a bug costs
+more than a coder being slow, and the review is the last gate before the work
+reaches a person. Pairing a cheap reviewer with an expensive coder is the one
+combination that reliably wastes both.
+
+**Test a cheap tier before trusting it with the loop.** The failure that matters
+is not bad code, it is an agent that cannot complete its own MCP `task_edit` —
+the task then sits where it was, looking healthy, and only the log says
+otherwise. A useful probe is a throwaway project, one task, and a prompt that
+says "create this file, then move this task to In Review": if both happen, the
+model can carry the loop. Measured this way, two cheap tiers that both *worked*
+still differed by roughly 2x in latency and output tokens on identical work, so
+it is worth comparing rather than guessing.
+
+A task with **no** `agent:` field is treated as a human task and never
+dispatches, so both fields need setting on anything the loop should pick up.
+
+> **Data handling:** model choice can also be a compliance decision — providers
+> differ on retention, and some expose that per model. That is a question for
+> your own provider terms and admin console, not something the dispatcher knows
+> about; it passes through whatever model you name.
+
 ## Using Cursor (`cursor-agent`)
 
 `cursor-agent` is supported alongside `claude`, and is the way to run the loop on
@@ -266,7 +350,7 @@ resume work the same way they do for Claude, and the live agent panel gets real
 - **Edit the prompts** — they're plain markdown. Add project-specific conventions, point at internal docs, change the verdict thresholds. Each round of running the loop will surface improvements.
 - **Per-task overrides** — set `onStatusChange:` on an individual task's frontmatter (or via the modal's "Advanced" section in the browser) to bypass the dispatcher for one task. Useful when a single task needs a different agent or no agent at all.
 - **Add new transitions** — add a `case` to the dispatcher and a new `<status>.md` file. The convention is: prompt filename = lowercase status with spaces collapsed.
-- **Different agents** — `claude`, `cursor-agent`, `codex` and `opencode` have dedicated launch branches (see *Using Cursor* above for the alias config); anything else is treated as a path and assumed Claude-compatible on stdin. The prompt format is generic markdown; only the MCP-tool calls in the prompts assume Backlog.md MCP is reachable.
+- **Different agents** — `claude`, `cursor-agent`, `codex` and `opencode` have dedicated launch branches; anything else is treated as a path and assumed Claude-compatible on stdin. See *Choosing an agent per task* for how to tier the aliases and pair coder with reviewer. The prompt format is generic markdown; only the MCP-tool calls in the prompts assume Backlog.md MCP is reachable.
 
 ## Per-invocation log files
 
