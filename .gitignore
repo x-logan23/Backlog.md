@@ -50,6 +50,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 !.claude/mcp-coder.json
 !.claude/mcp-reviewer.json
 
+# Cursor: ignore local state, keep the scaffolded MCP config.
+.cursor/*
+!.cursor/mcp.json
+
 # Gemini CLI session data
 .gemini
 

@@ -519,14 +519,39 @@ if [ -f "$config_file" ]; then
     done < "$config_file"
 fi
 
-# ── Model / effort flags (claude only) ────────────────────────────────────────
-# Per-agent model/effort drive --model/--effort. Only claude supports these
-# flags; codex/opencode launches are left unchanged.
-claude_model_args=""
-if [ "$agent_binary" = "claude" ]; then
-    [ -n "$agent_model" ] && claude_model_args="--model $agent_model"
-    [ -n "$agent_effort" ] && claude_model_args="$claude_model_args --effort $agent_effort"
-fi
+# ── Model / effort flags ──────────────────────────────────────────────────────
+# claude takes --model and --effort as two flags. cursor-agent takes --model but
+# has no --effort: it carries effort inside the model string as a bracket
+# override, e.g. 'claude-opus-4-8[context=1m,effort=high]'. Dropping an effort:
+# silently would leave the config looking honoured, so it warns instead.
+# codex/opencode take neither and are left unchanged.
+agent_model_args=""
+case "$agent_binary" in
+    claude)
+        [ -n "$agent_model" ] && agent_model_args="--model $agent_model"
+        [ -n "$agent_effort" ] && agent_model_args="$agent_model_args --effort $agent_effort"
+        ;;
+    cursor-agent)
+        [ -n "$agent_model" ] && agent_model_args="--model $agent_model"
+        if [ -n "$agent_effort" ]; then
+            echo "dispatch.sh: warning - cursor-agent has no --effort flag. Put it in the model string instead, e.g. model: \"${agent_model}[effort=${agent_effort}]\". Ignoring effort=$agent_effort."
+        fi
+        ;;
+esac
+
+# Flags every cursor-agent launch needs, fresh or resumed.
+#   -p                     headless; same flag claude uses
+#   --force                skip permission prompts AND the workspace-trust gate.
+#                          Without it cursor-agent prints a trust notice and
+#                          exits 0 having done nothing -- a silent no-op that
+#                          looks exactly like a healthy dispatch.
+#   --approve-mcps         otherwise the backlog MCP is "not loaded (needs
+#                          approval)" and the agent cannot read or edit tasks.
+#   --output-format stream-json
+#                          NDJSON to the dispatch log: tool_call/thinking events
+#                          for the live panel, plus session_id and token usage in
+#                          the final result, so nothing has to scrape a transcript.
+cursor_flags="-p --force --approve-mcps --output-format stream-json"
 
 echo "dispatch.sh: task=${TASK_ID:-?} status=${NEW_STATUS:-?} agent=$agent_name binary=$agent_binary"
 
@@ -535,7 +560,8 @@ echo "dispatch.sh: task=${TASK_ID:-?} status=${NEW_STATUS:-?} agent=$agent_name 
 # after a review with CHANGES REQUESTED. This preserves the full implementation
 # context in the session history; the rework message is minimal.
 is_resume_capable=0
-if [ "$agent_binary" = "claude" ] || [ "$agent_binary" = "codex" ] || [ "$agent_binary" = "opencode" ]; then
+if [ "$agent_binary" = "claude" ] || [ "$agent_binary" = "codex" ] || \
+   [ "$agent_binary" = "opencode" ] || [ "$agent_binary" = "cursor-agent" ]; then
     is_resume_capable=1
 fi
 
@@ -570,13 +596,17 @@ fi
         if [ "$agent_binary" = "codex" ]; then
             nohup codex exec resume "$coder_session_id" - \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
+        elif [ "$agent_binary" = "cursor-agent" ]; then
+            # shellcheck disable=SC2086 # intentional word-splitting of optional flags
+            nohup cursor-agent $cursor_flags --resume "$coder_session_id" $agent_model_args \
+                < "$rework_path" > "$log_file" 2> "$log_file.err" &
         elif [ "$agent_binary" = "opencode" ]; then
             nohup opencode run --dangerously-skip-permissions -s "$coder_session_id" \
                 -f "$rework_path" -- 'Read and follow the attached instructions.' \
                 > "$log_file" 2> "$log_file.err" &
         else
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude --resume "$coder_session_id" --dangerously-skip-permissions $claude_model_args \
+            nohup claude --resume "$coder_session_id" --dangerously-skip-permissions $agent_model_args \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
         fi
         : # nohup already detaches; `disown` is a bash builtin dash does not have
@@ -588,13 +618,17 @@ fi
         if [ "$agent_binary" = "codex" ]; then
             nohup codex exec resume "$reviewer_session_id" - \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
+        elif [ "$agent_binary" = "cursor-agent" ]; then
+            # shellcheck disable=SC2086 # intentional word-splitting of optional flags
+            nohup cursor-agent $cursor_flags --resume "$reviewer_session_id" $agent_model_args \
+                < "$resume_path" > "$log_file" 2> "$log_file.err" &
         elif [ "$agent_binary" = "opencode" ]; then
             nohup opencode run --dangerously-skip-permissions -s "$reviewer_session_id" \
                 -f "$resume_path" -- 'Read and follow the attached instructions.' \
                 > "$log_file" 2> "$log_file.err" &
         else
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude --resume "$reviewer_session_id" --dangerously-skip-permissions $claude_model_args \
+            nohup claude --resume "$reviewer_session_id" --dangerously-skip-permissions $agent_model_args \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
         fi
         : # nohup already detaches; `disown` is a bash builtin dash does not have
@@ -602,7 +636,7 @@ fi
     case "$agent_binary" in
         claude)
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude -p --dangerously-skip-permissions $claude_model_args \
+            nohup claude -p --dangerously-skip-permissions $agent_model_args \
                 < "$prompt_path" > "$log_file" 2> "$log_file.err" &
             ;;
         codex)
@@ -615,6 +649,13 @@ fi
             nohup opencode run --dangerously-skip-permissions \
                 -f "$prompt_path" -- 'Read and follow the attached instructions completely.' \
                 > "$log_file" 2> "$log_file.err" &
+            ;;
+        cursor-agent)
+            # Reads the prompt from stdin, like claude -- the positional
+            # [prompt...] argument is not used.
+            # shellcheck disable=SC2086 # intentional word-splitting of optional flags
+            nohup cursor-agent $cursor_flags $agent_model_args \
+                < "$prompt_path" > "$log_file" 2> "$log_file.err" &
             ;;
         *)
             # Treat as an absolute or relative path; assume claude-compatible stdin.

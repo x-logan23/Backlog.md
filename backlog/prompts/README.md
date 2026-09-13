@@ -204,12 +204,69 @@ If the log is empty after a status change, check:
 - That `shell` in `backlog.config.yml` matches an installed interpreter (Settings → Status Change Callback in the browser will flag missing shells).
 - That the prompt file the dispatcher chose actually exists (`code.md` / `review.md` / `ready.md`).
 
+## Using Cursor (`cursor-agent`)
+
+`cursor-agent` is supported alongside `claude`, and is the way to run the loop on
+a model other than Claude — `cursor-agent --list-models` shows what your account
+can reach (GPT-5.3 Codex, Grok, Gemini, Composer, Claude, …). A coder and a
+reviewer backed by *different* models is worth more than it sounds: a reviewer
+that shares the coder's blind spots is a weak reviewer.
+
+Name the model on an agent alias in `backlog.config.yml`, then put the alias on a
+task's `agent:` / `reviewAgent:`:
+
+```yaml
+agents:
+  - alias: "cursor-codex"
+    binary: "cursor-agent"
+    model: "gpt-5.3-codex-high"
+  - alias: "cursor-opus"
+    binary: "cursor-agent"
+    model: "claude-opus-5-thinking-high"
+```
+
+```yaml
+# in the task's frontmatter
+agent: cursor-codex
+reviewAgent: cursor-opus
+```
+
+The dispatcher launches it as:
+
+```
+cursor-agent -p --force --approve-mcps --output-format stream-json [--model …] < prompt
+```
+
+Four details that are not obvious, each of which breaks the loop quietly if
+missed:
+
+- **`--force` is not only about permissions.** It also clears the workspace-trust
+  gate. Without it `cursor-agent` prints a trust notice and **exits 0 having done
+  nothing** — a silent no-op indistinguishable from a healthy dispatch.
+- **`--approve-mcps` is required.** Without it the backlog server is
+  `not loaded (needs approval)` and the agent cannot read or edit tasks, so it
+  launches, finds no board, and stops.
+- **MCP config is per-workspace, not per-invocation.** `cursor-agent` has no
+  `--mcp-config` flag; it reads `.cursor/mcp.json` (or `~/.cursor/mcp.json`).
+  `backlog init` scaffolds the former. This means **the coder/reviewer MCP split
+  that `.claude/mcp-{coder,reviewer}.json` gives Claude is not expressible for
+  Cursor** — both roles get the same servers.
+- **There is no `--effort` flag.** Cursor carries effort inside the model string
+  as a bracket override, e.g. `model: "claude-opus-4-8[context=1m,effort=high]"`.
+  An `effort:` on a cursor alias is ignored, and the dispatcher says so rather
+  than pretending it took.
+
+Session handling needs nothing extra: `--output-format stream-json` puts
+`session_id` and token usage in the dispatch log itself, so rework and reviewer
+resume work the same way they do for Claude, and the live agent panel gets real
+`tool_call` / `thinking` events instead of having to scrape a transcript.
+
 ## Customizing
 
 - **Edit the prompts** — they're plain markdown. Add project-specific conventions, point at internal docs, change the verdict thresholds. Each round of running the loop will surface improvements.
 - **Per-task overrides** — set `onStatusChange:` on an individual task's frontmatter (or via the modal's "Advanced" section in the browser) to bypass the dispatcher for one task. Useful when a single task needs a different agent or no agent at all.
 - **Add new transitions** — add a `case` to the dispatcher and a new `<status>.md` file. The convention is: prompt filename = lowercase status with spaces collapsed.
-- **Different agents** — replace `claude` in the dispatcher with whatever CLI binary you want (`codex`, `gemini`, etc.). The prompt format is generic markdown; only the MCP-tool calls in the prompts assume Backlog.md MCP is reachable.
+- **Different agents** — `claude`, `cursor-agent`, `codex` and `opencode` have dedicated launch branches (see *Using Cursor* above for the alias config); anything else is treated as a path and assumed Claude-compatible on stdin. The prompt format is generic markdown; only the MCP-tool calls in the prompts assume Backlog.md MCP is reachable.
 
 ## Per-invocation log files
 
