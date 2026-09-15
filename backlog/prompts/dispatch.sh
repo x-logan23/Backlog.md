@@ -664,5 +664,16 @@ fi
             ;;
     esac
     fi
-    : # nohup already detaches; `disown` is a bash builtin dash does not have
+    # Record the agent's pid. /api/agent-status and /api/agent-activity both
+    # resolve liveness from `<log>.pid` and treat an unreadable pid as "nothing
+    # is running", so without this the live agent panel is permanently empty on
+    # POSIX -- the board shows no panes however many agents are out. dispatch.ps1
+    # has always written it; this side only ever *pruned* the file, in the log
+    # retention list, which is how the gap stayed invisible.
+    #
+    # One write here rather than one per branch: every launch above backgrounds
+    # exactly one process, and `$!` is the most recent one whichever branch ran.
+    # nohup execs the agent, so this is the agent's own pid, not a wrapper that
+    # exits immediately.
+    printf '%s' "$!" > "$log_file.pid"
 ) > /dev/null 2>&1

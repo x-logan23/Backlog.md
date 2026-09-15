@@ -454,3 +454,42 @@ describe("dispatch.sh — cursor-agent launch", () => {
 		expect(argv).toContain("gpt-5.3-codex");
 	});
 });
+
+describe("dispatch.sh — agent liveness", () => {
+	guarded("records the launched agent's pid next to its log", () => {
+		// /api/agent-status and /api/agent-activity both resolve liveness from
+		// `<log>.pid`; an unreadable pid reads as "nothing is running". Without
+		// this file the live agent panel is permanently empty on POSIX, which is
+		// exactly the state this dispatcher shipped in -- it pruned .pid files in
+		// the retention list but never wrote one.
+		const { promptsDir, scratchDispatcher } = makeProject("", "BACK-1", "cursor-agent");
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "cursor-agent");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(waitForFile(argsPath)).toBe(true);
+
+		const logsDir = join(promptsDir, "logs");
+		const pidFile = readdirSync(logsDir).find((f) => f.endsWith(".log.pid"));
+		expect(pidFile).toBeTruthy();
+
+		const pid = Number.parseInt(readFileSync(join(logsDir, String(pidFile)), "utf8").trim(), 10);
+		// A real pid, not an empty file or a stray newline.
+		expect(Number.isInteger(pid)).toBe(true);
+		expect(pid).toBeGreaterThan(0);
+		// It must sit beside the log the server looks next to, not in its own place.
+		const logStem = String(pidFile).replace(/\.log\.pid$/, "");
+		expect(readdirSync(logsDir)).toContain(`${logStem}.log`);
+	});
+
+	guarded("writes no pid file on a dry run, which launches nothing", () => {
+		const { promptsDir, scratchDispatcher } = makeProject("", "BACK-1", "cursor-agent");
+		const result = runDispatcher(scratchDispatcher);
+		expect(result.status).toBe(0);
+		expect(readdirSync(join(promptsDir, "logs")).some((f) => f.endsWith(".log.pid"))).toBe(false);
+	});
+});
