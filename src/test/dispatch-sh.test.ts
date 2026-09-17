@@ -494,6 +494,31 @@ describe("dispatch.sh — agent liveness", () => {
 	});
 });
 
+describe("dispatch.sh — claude feed", () => {
+	guarded("launches claude with stream-json, so the live panel has something to read", () => {
+		const { scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+
+		expect(argv).toContain("-p");
+		expect(argv).toContain("--dangerously-skip-permissions");
+		// Without these the log is one block of closing prose and the pane is
+		// empty for the whole run.
+		expect(argv).toContain("--output-format");
+		expect(argv).toContain("stream-json");
+		// claude refuses stream-json under --print without it.
+		expect(argv).toContain("--verbose");
+	});
+});
+
 describe("dispatch.sh — resuming a session", () => {
 	/** A previous dispatch log for (task, status), in the stream-json shape both binaries emit. */
 	const writePreviousLog = (promptsDir: string, taskId: string, safeStatus: string, sessionId: string) => {
@@ -551,6 +576,26 @@ describe("dispatch.sh — resuming a session", () => {
 		expect(result.stdout).toContain("coder rework - resuming session 11111111-2222-3333-4444-555555555555");
 		expect(waitForFile(argsPath)).toBe(true);
 		expect(readFileSync(argsPath, "utf8").split("\n")).toContain("11111111-2222-3333-4444-555555555555");
+	});
+
+	guarded("a resumed claude still streams, so the pane is not blank on rework", () => {
+		// Where #24 and #25 meet: resuming must not drop the stream-json flags,
+		// or a rework would resume correctly and show nothing while it worked.
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555");
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		runDispatcher(scratchDispatcher, { PATH: `${stubDir}:${process.env.PATH ?? ""}` }, { dryRun: false });
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+
+		expect(argv).toContain("--resume");
+		expect(argv).toContain("11111111-2222-3333-4444-555555555555");
+		expect(argv).toContain("--output-format");
+		expect(argv).toContain("stream-json");
+		expect(argv).toContain("--verbose");
 	});
 
 	guarded("prefers a Session ID written in the task over the log", () => {
