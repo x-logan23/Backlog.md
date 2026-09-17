@@ -2180,7 +2180,8 @@ export class BacklogServer {
 				const sessionIds = extractSessionIds(task?.rawContent ?? "");
 				const sessionId = (phase === "reviewer" ? sessionIds.reviewer : sessionIds.coder) ?? null;
 				let feedPath = logPath;
-				let source: "claude-transcript" | "codex-json" | "log-text" = kind === "codex" ? "codex-json" : "log-text";
+				let source: "claude-transcript" | "codex-json" | "cursor-json" | "log-text" =
+					kind === "codex" ? "codex-json" : kind === "cursor" ? "cursor-json" : "log-text";
 				// Without a transcript, a claude dispatch log is prose — read it as text.
 				let feedKind: FeedKind = kind === "claude" ? "text" : kind;
 				if (kind === "claude" && sessionId) {

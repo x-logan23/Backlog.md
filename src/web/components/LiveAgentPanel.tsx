@@ -57,6 +57,7 @@ const DETAIL_STYLES: Record<AgentEvent['kind'], string> = {
 const SOURCE_LABEL: Record<AgentActivity['source'], string> = {
 	'claude-transcript': 'transcript',
 	'codex-json': 'json stream',
+	'cursor-json': 'json stream',
 	'log-text': 'text log',
 };
 

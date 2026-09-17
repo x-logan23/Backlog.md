@@ -9,6 +9,7 @@ import {
 	isLikelyRunning,
 	parseClaudeLine,
 	parseCodexLine,
+	parseCursorLine,
 	parseLogStem,
 	safeSegment,
 	summarizeToolInput,
@@ -436,6 +437,88 @@ describe("feedKindForBinary", () => {
 		expect(feedKindForBinary("claude")).toBe("claude");
 		expect(feedKindForBinary("Claude.CMD".replace(".CMD", ""))).toBe("claude");
 		expect(feedKindForBinary("codex")).toBe("codex");
+		expect(feedKindForBinary("opencode")).toBe("text");
+	});
+});
+
+describe("parseCursorLine", () => {
+	// Shapes taken from a real cursor-agent stream-json log, not invented.
+	it("names a tool from the key cursor hangs the payload off", () => {
+		// There is no `name` field: the tool is `shellToolCall`, and the label has
+		// to come from stripping that suffix.
+		const line = JSON.stringify({
+			type: "tool_call",
+			subtype: "started",
+			timestamp_ms: 1789000000000,
+			tool_call: {
+				shellToolCall: { args: { command: "git diff origin/master..HEAD", workingDirectory: "/repo" } },
+				toolCallId: "call_1",
+			},
+		});
+		const parsed = parseCursorLine(line);
+		expect(parsed.events).toHaveLength(1);
+		expect(parsed.events[0]?.kind).toBe("tool");
+		expect(parsed.events[0]?.label).toBe("shell");
+		expect(parsed.events[0]?.detail).toBe("git diff origin/master..HEAD");
+		expect(parsed.events[0]?.at).toBe(new Date(1789000000000).toISOString());
+	});
+
+	it("summarizes each tool by its one useful argument", () => {
+		const call = (key: string, args: Record<string, unknown>) =>
+			parseCursorLine(JSON.stringify({ type: "tool_call", subtype: "started", tool_call: { [key]: { args } } }))
+				.events[0];
+		expect(call("readToolCall", { path: "/repo/src/a.ts" })?.detail).toBe("/repo/src/a.ts");
+		expect(call("globToolCall", { globPattern: "**/*.sql", targetDirectory: "/repo" })?.detail).toContain("**/*.sql");
+		expect(call("grepToolCall", { pattern: "bun test", path: "/repo" })?.detail).toContain("bun test");
+		expect(call("mcpToolCall", { name: "backlog-task_view" })?.detail).toBe("backlog-task_view");
+	});
+
+	it("renders only the started half of a tool call", () => {
+		// started and completed carry the same call_id; rendering both doubles
+		// every row in the pane.
+		const completed = JSON.stringify({
+			type: "tool_call",
+			subtype: "completed",
+			tool_call: { readToolCall: { args: { path: "/repo/a.ts" } } },
+		});
+		expect(parseCursorLine(completed).events).toHaveLength(0);
+	});
+
+	it("drops thinking deltas, which are fragments rather than events", () => {
+		const delta = JSON.stringify({ type: "thinking", subtype: "delta", text: "**Dec" });
+		expect(parseCursorLine(delta).events).toHaveLength(0);
+	});
+
+	it("reads assistant text and the run's token totals", () => {
+		const assistant = JSON.stringify({
+			type: "assistant",
+			message: { role: "assistant", content: [{ type: "text", text: "Reviewing BNK-2 now." }] },
+		});
+		expect(parseCursorLine(assistant).events[0]?.detail).toBe("Reviewing BNK-2 now.");
+
+		const result = JSON.stringify({
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "APPROVE",
+			usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 1 },
+		});
+		const parsed = parseCursorLine(result);
+		expect(parsed.events[0]?.kind).toBe("result");
+		// Cursor reports a total once per run, so it replaces rather than adds.
+		expect(parsed.usageAbsolute?.total).toBe(18);
+		expect(parsed.usage).toBeUndefined();
+	});
+
+	it("surfaces a failed run as an error event", () => {
+		const parsed = parseCursorLine(JSON.stringify({ type: "result", is_error: true, result: "rate limited" }));
+		expect(parsed.events.some((e) => e.kind === "error")).toBe(true);
+	});
+
+	it("maps the cursor-agent binary to the cursor feed", () => {
+		// The whole bug: this returned "text", so NDJSON rendered as raw strings.
+		expect(feedKindForBinary("cursor-agent")).toBe("cursor");
+		expect(feedKindForBinary("claude")).toBe("claude");
 		expect(feedKindForBinary("opencode")).toBe("text");
 	});
 });
