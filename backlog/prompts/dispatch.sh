@@ -553,6 +553,15 @@ esac
 #                          the final result, so nothing has to scrape a transcript.
 cursor_flags="-p --force --approve-mcps --output-format stream-json"
 
+# Flags every claude launch needs. `--output-format stream-json` makes the
+# dispatch log a real feed -- tool calls, usage and timestamps -- instead of the
+# single block of closing prose plain `-p` writes when the agent is already
+# finished. The live agent panel reads this log, so without it every claude pane
+# sits empty for the whole run and then prints one paragraph.
+# `--verbose` is not optional: claude refuses stream-json under --print without
+# it ("--output-format=stream-json requires --verbose").
+claude_flags="-p --dangerously-skip-permissions --output-format stream-json --verbose"
+
 echo "dispatch.sh: task=${TASK_ID:-?} status=${NEW_STATUS:-?} agent=$agent_name binary=$agent_binary"
 
 # ── Rework detection (claude only) ───────────────────────────────────────────
@@ -606,7 +615,7 @@ fi
                 > "$log_file" 2> "$log_file.err" &
         else
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude --resume "$coder_session_id" --dangerously-skip-permissions $agent_model_args \
+            nohup claude --resume "$coder_session_id" $claude_flags $agent_model_args \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
         fi
         : # nohup already detaches; `disown` is a bash builtin dash does not have
@@ -628,7 +637,7 @@ fi
                 > "$log_file" 2> "$log_file.err" &
         else
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude --resume "$reviewer_session_id" --dangerously-skip-permissions $agent_model_args \
+            nohup claude --resume "$reviewer_session_id" $claude_flags $agent_model_args \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
         fi
         : # nohup already detaches; `disown` is a bash builtin dash does not have
@@ -636,7 +645,7 @@ fi
     case "$agent_binary" in
         claude)
             # shellcheck disable=SC2086 # intentional word-splitting of optional flags
-            nohup claude -p --dangerously-skip-permissions $agent_model_args \
+            nohup claude $claude_flags $agent_model_args \
                 < "$prompt_path" > "$log_file" 2> "$log_file.err" &
             ;;
         codex)
