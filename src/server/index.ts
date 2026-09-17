@@ -2181,8 +2181,10 @@ export class BacklogServer {
 				const sessionId = (phase === "reviewer" ? sessionIds.reviewer : sessionIds.coder) ?? null;
 				let feedPath = logPath;
 				let source: "claude-transcript" | "codex-json" | "log-text" = kind === "codex" ? "codex-json" : "log-text";
-				// Without a transcript, a claude dispatch log is prose — read it as text.
-				let feedKind: FeedKind = kind === "claude" ? "text" : kind;
+				// A claude dispatch log is now NDJSON (`--output-format stream-json`),
+				// so read it as a claude feed. `parseClaudeFeedLine` falls back to
+				// prose per line, which is what a log from an older dispatcher holds.
+				let feedKind: FeedKind = kind;
 				if (kind === "claude" && sessionId) {
 					const transcript = join(
 						homedir(),

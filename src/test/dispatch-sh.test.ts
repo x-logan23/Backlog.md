@@ -493,3 +493,28 @@ describe("dispatch.sh — agent liveness", () => {
 		expect(readdirSync(join(promptsDir, "logs")).some((f) => f.endsWith(".log.pid"))).toBe(false);
 	});
 });
+
+describe("dispatch.sh — claude feed", () => {
+	guarded("launches claude with stream-json, so the live panel has something to read", () => {
+		const { scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+
+		expect(argv).toContain("-p");
+		expect(argv).toContain("--dangerously-skip-permissions");
+		// Without these the log is one block of closing prose and the pane is
+		// empty for the whole run.
+		expect(argv).toContain("--output-format");
+		expect(argv).toContain("stream-json");
+		// claude refuses stream-json under --print without it.
+		expect(argv).toContain("--verbose");
+	});
+});
