@@ -108,6 +108,28 @@ fi
 log_dir="$prompts_dir/logs"
 mkdir -p "$log_dir"
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# The session id an agent reported for one (task, status), taken from the most
+# recent dispatch log for that pair. Empty when there is no such log or the log
+# is not stream-json. Used only as a fallback; see the call site.
+last_session_id_for() {
+    # Every substitution needs `|| true`: the script runs under `set -e`, and a
+    # non-matching ls or grep would otherwise abort the whole dispatch rather
+    # than simply meaning "no previous session".
+    _sid_status="$(sanitize "$1")"
+    # Newest first, but keep looking past logs that carry no id. A dispatch that
+    # died before the agent emitted anything leaves an empty log, and stopping at
+    # the newest file would report "no session" while a resumable one sits right
+    # behind it.
+    for _sid_log in $(ls -t "$log_dir"/*-"$safe_task_id"-"$_sid_status".log 2>/dev/null || true); do
+        _sid="$(grep -oE '"session_id":"[A-Za-z0-9_-]+"' "$_sid_log" 2>/dev/null | tail -1 | sed 's/.*:"//; s/"$//' || true)"
+        if [ -n "$_sid" ]; then
+            printf '%s' "$_sid"
+            return 0
+        fi
+    done
+    return 0
+}
 safe_task_id="$(sanitize "${TASK_ID:-unknown}")"
 
 # ── Blocked ──────────────────────────────────────────────────────────────────
@@ -448,10 +470,25 @@ if [ -n "$task_file" ] && [ -f "$task_file" ]; then
     # as a failed status-change callback. Hence `|| true` on each.
     task_agent="$(grep -m1 '^agent:' "$task_file" 2>/dev/null | sed "s/^agent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
     task_review_agent="$(grep -m1 '^reviewAgent:' "$task_file" 2>/dev/null | sed "s/^reviewAgent:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
-    # Extract the last "Session ID: <uuid>" from the task body for --resume on rework.
-    # Match both UUID (claude/codex) and ses_* (opencode) session ID formats.
+    # Session ids for --resume on rework. The task body is checked first because
+    # a human or a prompt may have written one there deliberately, and that is
+    # the documented contract. Nothing writes it today, which is why resume has
+    # never once fired -- see the log fallback below.
+    # Match both UUID (claude/cursor/codex) and ses_* (opencode) formats.
     coder_session_id="$(grep -oE 'Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Session ID: //' || true)"
     reviewer_session_id="$(grep -oE 'Reviewer Session ID: ([a-f0-9-]{36}|ses_[A-Za-z0-9]+)' "$task_file" 2>/dev/null | tail -1 | sed 's/Reviewer Session ID: //' || true)"
+
+    # Fall back to the agent's own dispatch log, which is where the id actually
+    # exists. Both stream-json binaries report `"session_id":"..."` in every
+    # event, so the previous run for this (task, status) names the session to
+    # resume without anyone having had to write it down.
+    #
+    # Safe to read the newest matching log: this runs before the current
+    # dispatch's `.log` is created, so the newest match is the *previous* run.
+    # opencode logs are plain text and carry no id, so they keep the task-body
+    # path and simply do not resume -- the same behaviour as before.
+    [ -n "$coder_session_id" ] || coder_session_id="$(last_session_id_for "In Progress" || true)"
+    [ -n "$reviewer_session_id" ] || reviewer_session_id="$(last_session_id_for "In Review" || true)"
 fi
 
 # Tasks without an `agent:` field are human tasks — do not dispatch an
@@ -589,6 +626,19 @@ if [ "$is_resume_capable" = "1" ] && \
     is_reviewer_resume=1
 fi
 
+# Say whether this dispatch resumes or starts fresh. The equivalent lines inside
+# the launch subshell below are swallowed -- it ends `) > /dev/null 2>&1` -- so
+# without this a resume is indistinguishable from a cold start in the hook
+# output, and "did it actually resume?" can only be answered by reading argv off
+# a live process.
+if [ "$is_coder_rework" = "1" ]; then
+    echo "dispatch.sh: coder rework - resuming session $coder_session_id"
+elif [ "$is_reviewer_resume" = "1" ]; then
+    echo "dispatch.sh: reviewer resume - resuming session $reviewer_session_id"
+else
+    echo "dispatch.sh: fresh session (no prior session id for ${TASK_ID:-?})"
+fi
+
 # ── Per-agent launch ─────────────────────────────────────────────────────────
 # The agent runs in the task's repository when it names one, and at the project
 # root otherwise. It can still reach the backlog either way: the CLI and the MCP
@@ -601,7 +651,6 @@ fi
         rework_msg="The reviewer requested changes on task ${TASK_ID:-?}. Read the task via the Backlog.md MCP (task_view), find the latest Review section with CHANGES REQUESTED, address every finding, run the tests, and move the task back to In Review when done."
         rework_path="$log_file.rework"
         printf '%s' "$rework_msg" > "$rework_path"
-        echo "dispatch.sh: coder rework - resuming session $coder_session_id"
         if [ "$agent_binary" = "codex" ]; then
             nohup codex exec resume "$coder_session_id" - \
                 < "$rework_path" > "$log_file" 2> "$log_file.err" &
@@ -623,7 +672,6 @@ fi
         resume_msg="The coder has addressed the findings on task ${TASK_ID:-?}. Re-read the task via the Backlog.md MCP (task_view), verify every fix, run the tests, and move to Human Review if everything passes or request more changes if issues remain."
         resume_path="$log_file.resume"
         printf '%s' "$resume_msg" > "$resume_path"
-        echo "dispatch.sh: reviewer resume - resuming session $reviewer_session_id"
         if [ "$agent_binary" = "codex" ]; then
             nohup codex exec resume "$reviewer_session_id" - \
                 < "$resume_path" > "$log_file" 2> "$log_file.err" &
