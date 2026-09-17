@@ -493,3 +493,99 @@ describe("dispatch.sh — agent liveness", () => {
 		expect(readdirSync(join(promptsDir, "logs")).some((f) => f.endsWith(".log.pid"))).toBe(false);
 	});
 });
+
+describe("dispatch.sh — resuming a session", () => {
+	/** A previous dispatch log for (task, status), in the stream-json shape both binaries emit. */
+	const writePreviousLog = (promptsDir: string, taskId: string, safeStatus: string, sessionId: string) => {
+		const logsDir = join(promptsDir, "logs");
+		mkdirSync(logsDir, { recursive: true });
+		writeFileSync(
+			join(logsDir, `20260101-000000-1-${taskId}-${safeStatus}.log`),
+			`${JSON.stringify({ type: "assistant", session_id: sessionId, message: { id: "m", content: [] } })}\n` +
+				`${JSON.stringify({ type: "result", subtype: "success", session_id: sessionId })}\n`,
+		);
+	};
+
+	guarded("resumes the coder's session on rework, from the id in its own log", () => {
+		// Until now this never fired: the id was only ever read from a
+		// `Session ID:` line in the task, and nothing writes one. Every rework
+		// silently started a fresh session with no memory of the implementation.
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED: fix the parser.\n`);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555");
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("coder rework - resuming session 11111111-2222-3333-4444-555555555555");
+
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+		expect(argv).toContain("--resume");
+		expect(argv).toContain("11111111-2222-3333-4444-555555555555");
+	});
+
+	guarded("looks past a newer empty log to the last run that reported an id", () => {
+		// A dispatch that dies before the agent emits anything leaves an empty
+		// log. Stopping at the newest file would report "no session" while a
+		// perfectly resumable one sits right behind it, and the rework would
+		// silently start cold.
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555");
+		// Newer, and empty — the shape a crashed dispatch leaves behind.
+		writeFileSync(join(promptsDir, "logs", "20260202-000000-2-BACK-1-In_Progress.log"), "");
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.stdout).toContain("coder rework - resuming session 11111111-2222-3333-4444-555555555555");
+		expect(waitForFile(argsPath)).toBe(true);
+		expect(readFileSync(argsPath, "utf8").split("\n")).toContain("11111111-2222-3333-4444-555555555555");
+	});
+
+	guarded("prefers a Session ID written in the task over the log", () => {
+		// The task body is the documented contract; a human or prompt that fills
+		// it in must win over whatever the last log happened to contain.
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(
+			taskFile,
+			`${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\nSession ID: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n`,
+		);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555");
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		runDispatcher(scratchDispatcher, { PATH: `${stubDir}:${process.env.PATH ?? ""}` }, { dryRun: false });
+		expect(waitForFile(argsPath)).toBe(true);
+		const argv = readFileSync(argsPath, "utf8").split("\n").filter(Boolean);
+		expect(argv).toContain("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+		expect(argv).not.toContain("11111111-2222-3333-4444-555555555555");
+	});
+
+	guarded("starts fresh when there is no id anywhere, rather than passing an empty --resume", () => {
+		const { tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("fresh session");
+		expect(waitForFile(argsPath)).toBe(true);
+		expect(readFileSync(argsPath, "utf8").split("\n")).not.toContain("--resume");
+	});
+});
