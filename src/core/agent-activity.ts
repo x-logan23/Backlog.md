@@ -434,6 +434,19 @@ export function parseTextLine(line: string): ParsedLine {
 }
 
 /**
+ * A line from a claude dispatch log, which can be either shape.
+ *
+ * With `--output-format stream-json` the log is NDJSON and carries tool calls,
+ * usage and timestamps. A log written by an older dispatcher — plain `-p` — is
+ * prose, and prose is all it will ever be. Deciding per line rather than per
+ * file means a project whose dispatcher was upgraded mid-run still renders the
+ * prose it already wrote, instead of the pane going blank retroactively.
+ */
+export function parseClaudeFeedLine(line: string): ParsedLine {
+	return line.trimStart().startsWith("{") ? parseClaudeLine(line) : parseTextLine(line);
+}
+
+/**
  * Incremental tail over one agent feed.
  *
  * A coder's transcript reaches double-digit megabytes, and the board polls every
@@ -502,7 +515,7 @@ export class AgentFeedTail {
 
 		const parse =
 			this.kind === "claude"
-				? parseClaudeLine
+				? parseClaudeFeedLine
 				: this.kind === "codex"
 					? parseCodexLine
 					: this.kind === "cursor"

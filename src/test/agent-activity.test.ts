@@ -7,6 +7,7 @@ import {
 	feedKindForBinary,
 	hopCount,
 	isLikelyRunning,
+	parseClaudeFeedLine,
 	parseClaudeLine,
 	parseCodexLine,
 	parseCursorLine,
@@ -438,6 +439,48 @@ describe("feedKindForBinary", () => {
 		expect(feedKindForBinary("Claude.CMD".replace(".CMD", ""))).toBe("claude");
 		expect(feedKindForBinary("codex")).toBe("codex");
 		expect(feedKindForBinary("opencode")).toBe("text");
+	});
+});
+
+describe("parseClaudeFeedLine", () => {
+	// A claude dispatch log is NDJSON once the dispatcher passes
+	// --output-format stream-json, but a log written by an older dispatcher is
+	// prose. The pane has to render whichever it is handed.
+	it("reads a stream-json assistant line as real events", () => {
+		const line = JSON.stringify({
+			type: "assistant",
+			timestamp: "2026-09-17T10:00:00.000Z",
+			message: {
+				id: "msg_1",
+				content: [
+					{ type: "text", text: "Scaffolding the module." },
+					{ type: "tool_use", name: "Bash", input: { command: "bun test" } },
+				],
+				usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 2 },
+			},
+		});
+		const parsed = parseClaudeFeedLine(line);
+		expect(parsed.events.map((e) => e.kind)).toEqual(["message", "tool"]);
+		expect(parsed.events[1]?.label).toBe("Bash");
+		expect(parsed.usage?.total).toBe(17);
+	});
+
+	it("falls back to prose for a line an older dispatcher wrote", () => {
+		// The whole point of deciding per line: a pane must not go blank just
+		// because the log predates the stream-json flag.
+		const parsed = parseClaudeFeedLine("Done. Moved BACK-7 to In Review.");
+		expect(parsed.events).toHaveLength(1);
+		expect(parsed.events[0]?.label).toBe("output");
+		expect(parsed.events[0]?.detail).toContain("Moved BACK-7");
+	});
+
+	it("agrees with parseClaudeLine on JSON, so the hybrid adds no drift", () => {
+		const line = JSON.stringify({ type: "assistant", message: { id: "m", content: [{ type: "text", text: "hi" }] } });
+		expect(parseClaudeFeedLine(line)).toEqual(parseClaudeLine(line));
+	});
+
+	it("ignores a blank line rather than emitting an empty pane row", () => {
+		expect(parseClaudeFeedLine("   ").events).toHaveLength(0);
 	});
 });
 
