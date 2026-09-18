@@ -19,6 +19,151 @@ the specifics there.
 
 ---
 
+# Session of 2026-09-13/17 — the live agent panel, end to end
+
+## Why this session happened
+
+The panel had never worked outside Windows, and nobody knew that: it was
+reported as "the pane disappears", which sounds like a UI quirk. Chasing it
+turned up four separate defects between the dispatcher and the panel, each of
+which failed silently and looked like normal operation. All four are fixed
+(#23, #24, #25, #26).
+
+**The shape they share is worth stating once.** Every one of them produced
+*something* — an empty pane, a paragraph at the end, a cold agent, a wall of
+JSON — so none looked like a failure. This dispatcher/panel boundary has no
+loud errors; it degrades. Assume a quiet wrong answer rather than a crash when
+something here looks "a bit off".
+
+## 1. The panel was Windows-only (#23)
+
+`/api/agent-status` and `/api/agent-activity` share `resolveLiveness()`, which
+opens `<log>.pid` and treats an unreadable pid as *nothing is running*,
+whatever the task status says. `dispatch.ps1` has always written that file.
+**`dispatch.sh` never did**, so both endpoints returned `[]` for ever on POSIX.
+
+What hid it: `dispatch.sh` mentions `.pid` exactly once, in the log-retention
+list — it has been **pruning a file it never created**. A grep for "pid" finds
+that hit and stops.
+
+The write goes in one place, not at each of the thirteen launch branches: they
+all background exactly one process inside the same subshell, and `$!` is the
+most recent one whichever branch ran. `nohup` execs the agent, so it is the
+agent's own pid.
+
+## 2. claude had no feed to show (#24)
+
+Plain `-p` writes only the assistant's closing message — no tool calls, no
+usage, and nothing at all until the agent has finished. The panel was built to
+read Claude Code's session transcript instead, and that path could not fire for
+**two independent reasons**:
+
+- it is keyed on a `Session ID:` line in the task, which nothing writes; and
+- the slug is computed from the project root, while a task with `repo:` runs the
+  agent *inside that repo*, so the transcript is written under the repo's slug.
+
+Both are multi-repo dispatch arriving after the panel was designed.
+
+Rather than repair two lookups, the log itself became the feed:
+`--output-format stream-json --verbose`. **`--verbose` is not optional** —
+claude refuses stream-json under `--print` without it. No new parser was
+needed: a stream-json assistant event carries the same
+`message.content[] / message.usage` as a transcript line.
+
+`parseClaudeFeedLine` decides **per line, not per file** — a `{`-prefixed line
+is JSON, anything else is prose. A project upgraded mid-run keeps rendering the
+prose it already wrote instead of going blank retroactively.
+
+## 3. Resume had never once fired (#25)
+
+`is_coder_rework` and `is_reviewer_resume` both gate on that same unwritten
+`Session ID:` line, so both were **dead code**. Every rework started a cold
+session with no memory of the implementation it was sent back to fix.
+
+The id was never missing, only unrecorded: both stream-json binaries report
+`"session_id"` in every event, so the previous dispatch's own log names the
+session. The task body still wins when it has one — that is the documented
+contract — and the log is the fallback.
+
+Two details that cost time:
+
+- **Scan newest-first *past* empty logs.** A dispatch that dies before the agent
+  emits anything leaves a zero-byte log, and stopping at the newest file reports
+  "no session" while a resumable one sits directly behind it.
+- **Every substitution needs `|| true`.** Under `set -e` a non-matching `ls` or
+  `grep` aborts the whole dispatch rather than meaning "no previous session".
+  This cost eight failing tests before it was spotted.
+
+**A resume was also invisible.** The `resuming session` echoes sit *inside* the
+launch subshell, which ends `) > /dev/null 2>&1`, so they were discarded — a
+resume could not be told from a cold start without catching argv off a live
+process. The decision is now announced before the subshell, including the
+`fresh session` case. (This is also what made a correct dispatcher look broken
+under test: the assertion was on a message the shell was throwing away.)
+
+## 4. cursor-agent rendered as raw JSON (#26)
+
+`feedKindForBinary` mapped it to `"text"`, so its NDJSON fell through to the
+plain-text parser and every event became a raw JSON string. It *looked* like
+output, which is why it read as ugly rather than broken — the cursor panes
+appeared to work while the claude ones were empty.
+
+Cursor's shape is its own:
+
+- **a tool is named by the key the payload hangs off** — `readToolCall`,
+  `shellToolCall`, `mcpToolCall` — with no `name` field anywhere;
+- `usage` is camelCase and reported once per run as a total, so it replaces the
+  running total rather than adding, like codex;
+- timestamps are `timestamp_ms`, not ISO.
+
+Two deliberate omissions: only `tool_call/started` is rendered (`completed`
+repeats the same `call_id` and would double every row, the same reason
+`parseCodexLine` renders one side of its pair), and `thinking/delta` is dropped
+because the deltas are partial fragments that bury the assistant text and tool
+calls.
+
+## Things that cost time, and will again
+
+- **The dispatcher is a shell script; the parser is in the binary.** A
+  `dispatch.sh` change takes effect on the next dispatch. Anything under `src/`
+  needs `bun run build && bun run install:local` and a server restart — a page
+  reload never shows it. Twice this session a fix looked not to work because the
+  binary was stale.
+- **The running server holds the hook authority**, so it fires `onStatusChange`
+  with *its* environment, not the shell you typed `backlog task edit` into.
+  Putting a stub binary first on `PATH` therefore does **not** intercept a
+  dispatch triggered that way: you get a real agent. Stub-on-PATH only works
+  when invoking `dispatch.sh` directly.
+- **macOS `find -newermt "-2 hours"` silently matches nothing.** BSD `find`
+  wants an absolute date. A "nothing was modified" answer from it is not
+  evidence of anything; it produced a false all-clear here.
+- **Gitignored directories hide agent work from `git status`.** Between that and
+  the `find` trap, an agent's output can look absent when five files are sitting
+  on disk.
+- **PRs that append a `describe` block to the same test file always conflict**,
+  and the resolution is always "keep both". Three of these merges needed it;
+  none needed logic changes.
+
+## What is left
+
+1. **`dispatch.ps1` has no cursor-agent branch.** Deliberate: cursor-agent ships
+   on Windows, but this could only be tested on macOS, and the precedent is to
+   leave the untestable half alone rather than write it blind.
+2. **The Windows `dispatch.ps1` stdin test** is still the only failing test in
+   the repo. Worth noting §3 of the 09-11 notes and the stub used here: the
+   POSIX tests hit the same create-empty-then-fill race and needed an atomic
+   `.part`-then-rename, which is a concrete hypothesis for the Windows side.
+3. **claude's feed source is still labelled `log-text`** in the panel. codex and
+   cursor have their own labels; claude's log is NDJSON now too, so the label is
+   merely stale rather than wrong-in-effect.
+4. **The prompts never ask an agent to record its session id.** Resume no longer
+   needs it, but the task-body contract is still documented and still unused —
+   either wire it or drop it from the docs.
+5. Carried over: the three LOW findings from the v1.46.1 review (Gemini `--`
+   separator, `withTimeout` not cancelling, the duplicated instruction map).
+
+---
+
 # Session of 2026-09-12 — cursor-agent, and running the loop on other models
 
 ## Why this session happened
