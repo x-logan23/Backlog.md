@@ -44,7 +44,7 @@ export interface TokenTotals {
 }
 
 /** Which parser a feed needs. Mirrors the agent binary the dispatcher launched. */
-export type FeedKind = "claude" | "codex" | "text";
+export type FeedKind = "claude" | "codex" | "cursor" | "text";
 
 export const emptyTokens = (): TokenTotals => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0, total: 0 });
 
@@ -321,6 +321,111 @@ export function parseCodexLine(line: string): ParsedLine {
 	return NO_EVENTS;
 }
 
+/**
+ * One line of a cursor-agent `--output-format stream-json` feed.
+ *
+ * Cursor names a tool by the *key* it hangs the payload off -- `readToolCall`,
+ * `shellToolCall`, `mcpToolCall` -- rather than by a `name` field, so the label
+ * comes from stripping that suffix.
+ *
+ * Only `tool_call/started` is rendered. `completed` repeats the same `call_id`
+ * and would double every row -- the same reason parseCodexLine renders one side
+ * of its pair -- and started is the half worth showing while an agent is still
+ * working, because it arrives when the tool runs rather than when it returns.
+ *
+ * `thinking/delta` is dropped on purpose: the deltas are partial fragments, and
+ * one pane row per fragment buries the assistant text and tool calls that
+ * actually say what the agent is doing.
+ */
+export function parseCursorLine(line: string): ParsedLine {
+	let record: Record<string, unknown>;
+	try {
+		record = JSON.parse(line) as Record<string, unknown>;
+	} catch {
+		return NO_EVENTS;
+	}
+
+	const type = record.type;
+	const subtype = record.subtype;
+	const ms = typeof record.timestamp_ms === "number" ? record.timestamp_ms : undefined;
+	const at = ms ? new Date(ms).toISOString() : undefined;
+
+	if (type === "system" && subtype === "init") {
+		const model = typeof record.model === "string" ? record.model : "";
+		return { events: [{ kind: "system", label: "session", detail: model, at }] };
+	}
+
+	if (type === "assistant") {
+		const message = record.message as Record<string, unknown> | undefined;
+		const content = Array.isArray(message?.content) ? message.content : [];
+		const events: AgentEvent[] = [];
+		for (const raw of content) {
+			const block = raw as Record<string, unknown>;
+			if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+				events.push({ kind: "message", label: "assistant", detail: oneLine(block.text, 400), at });
+			}
+		}
+		return { events };
+	}
+
+	if (type === "tool_call" && subtype === "started") {
+		const call = record.tool_call as Record<string, unknown> | undefined;
+		if (!call) return NO_EVENTS;
+		const key = Object.keys(call).find((k) => k.endsWith("ToolCall"));
+		if (!key) return NO_EVENTS;
+		const name = key.slice(0, -"ToolCall".length);
+		const args = (call[key] as Record<string, unknown> | undefined)?.args;
+		return { events: [{ kind: "tool", label: name, detail: summarizeCursorArgs(name, args), at }] };
+	}
+
+	if (type === "result") {
+		const events: AgentEvent[] = [];
+		const text = typeof record.result === "string" ? record.result.trim() : "";
+		if (text) events.push({ kind: "result", label: "result", detail: oneLine(text, 400), at });
+		if (record.is_error === true) {
+			events.push({ kind: "error", label: "failed", detail: oneLine(text || "agent reported an error", 200), at });
+		}
+
+		const usageRaw = record.usage as Record<string, unknown> | undefined;
+		if (!usageRaw) return { events };
+		const num = (key: string): number => (typeof usageRaw[key] === "number" ? (usageRaw[key] as number) : 0);
+		const input = num("inputTokens");
+		const output = num("outputTokens");
+		const cacheRead = num("cacheReadTokens");
+		const cacheCreate = num("cacheWriteTokens");
+		// Reported once per run as a total, so it replaces rather than adds.
+		return {
+			events,
+			usageAbsolute: { input, output, cacheCreate, cacheRead, total: input + output + cacheCreate + cacheRead },
+		};
+	}
+
+	return NO_EVENTS;
+}
+
+/** The one useful field per cursor tool, so a pane row reads like a command rather than a blob. */
+function summarizeCursorArgs(name: string, args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	const str = (key: string): string => (typeof a[key] === "string" ? (a[key] as string) : "");
+	switch (name) {
+		case "shell":
+			return oneLine(str("command"), 300);
+		case "read":
+			return oneLine(str("path"), 200);
+		case "glob":
+			return oneLine([str("globPattern"), str("targetDirectory")].filter(Boolean).join("  in  "), 200);
+		case "grep":
+			return oneLine([str("pattern"), str("path")].filter(Boolean).join("  in  "), 200);
+		case "mcp":
+			return oneLine(str("name"), 200);
+		case "getMcpTools":
+			return oneLine(str("server"), 100);
+		default:
+			return oneLine(JSON.stringify(a), 200);
+	}
+}
+
 /** A plain-text log line (opencode, or claude's `-p` prose). */
 export function parseTextLine(line: string): ParsedLine {
 	const trimmed = line.trim();
@@ -408,7 +513,14 @@ export class AgentFeedTail {
 		// the rest of it arrives, or a JSON record would be parsed half-written.
 		this.pending = lines.pop() ?? "";
 
-		const parse = this.kind === "claude" ? parseClaudeFeedLine : this.kind === "codex" ? parseCodexLine : parseTextLine;
+		const parse =
+			this.kind === "claude"
+				? parseClaudeFeedLine
+				: this.kind === "codex"
+					? parseCodexLine
+					: this.kind === "cursor"
+						? parseCursorLine
+						: parseTextLine;
 
 		for (const line of lines) {
 			if (this.dropNextLine) {
@@ -602,5 +714,9 @@ export function feedKindForBinary(binary: string): FeedKind {
 	const normalized = binary.toLowerCase();
 	if (normalized === "claude") return "claude";
 	if (normalized === "codex") return "codex";
+	// cursor-agent is launched with --output-format stream-json, so its log is a
+	// structured feed. Without this it fell through to "text" and every event
+	// rendered as a raw JSON string.
+	if (normalized === "cursor-agent") return "cursor";
 	return "text";
 }

@@ -2180,10 +2180,12 @@ export class BacklogServer {
 				const sessionIds = extractSessionIds(task?.rawContent ?? "");
 				const sessionId = (phase === "reviewer" ? sessionIds.reviewer : sessionIds.coder) ?? null;
 				let feedPath = logPath;
-				let source: "claude-transcript" | "codex-json" | "log-text" = kind === "codex" ? "codex-json" : "log-text";
-				// A claude dispatch log is now NDJSON (`--output-format stream-json`),
-				// so read it as a claude feed. `parseClaudeFeedLine` falls back to
-				// prose per line, which is what a log from an older dispatcher holds.
+				let source: "claude-transcript" | "codex-json" | "cursor-json" | "log-text" =
+					kind === "codex" ? "codex-json" : kind === "cursor" ? "cursor-json" : "log-text";
+				// Both claude and cursor dispatch logs are now NDJSON
+				// (`--output-format stream-json`), so each is read as its own feed
+				// rather than as text. `parseClaudeFeedLine` falls back to prose per
+				// line, which is what a log from an older dispatcher holds.
 				let feedKind: FeedKind = kind;
 				if (kind === "claude" && sessionId) {
 					const transcript = join(

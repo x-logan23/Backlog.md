@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from "react";
 
 /** One normalized event from an agent's feed. Mirrors core/agent-activity.ts. */
 export interface AgentEvent {
-	kind: 'message' | 'tool' | 'result' | 'error' | 'system';
+	kind: "message" | "tool" | "result" | "error" | "system";
 	label: string;
 	detail: string;
 	at?: string;
@@ -20,7 +20,7 @@ export interface AgentActivity {
 	taskId: string;
 	taskTitle: string;
 	status: string;
-	phase: 'coder' | 'reviewer' | 'notifier';
+	phase: "coder" | "reviewer" | "notifier";
 	agentName: string;
 	agentBinary: string;
 	/** Corroborated liveness — a live pid alone is NOT enough (see isLikelyRunning). */
@@ -38,7 +38,7 @@ export interface AgentActivity {
 	tokensPartial: boolean;
 	events: AgentEvent[];
 	sessionId: string | null;
-	source: 'claude-transcript' | 'codex-json' | 'log-text';
+	source: "claude-transcript" | "codex-json" | "cursor-json" | "log-text";
 	logFile: string;
 }
 
@@ -50,7 +50,7 @@ let consumerCount = 0;
 
 async function poll() {
 	try {
-		const res = await fetch('/api/agent-activity');
+		const res = await fetch("/api/agent-activity");
 		if (!res.ok) return;
 		cache = (await res.json()) as AgentActivity[];
 		for (const fn of listeners) fn();
