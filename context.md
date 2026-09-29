@@ -19,6 +19,116 @@ the specifics there.
 
 ---
 
+# Session of 2026-09-28 — salvaging a deployment's fixes, and a session-ID gap that was real
+
+## Why this session happened
+
+`main` had drifted behind `origin/main` by 10 commits (four merged PRs: PID
+recording for POSIX, real feeds for claude/cursor-agent in the live panel,
+resuming sessions from an agent's own log). Fast-forwarding first was
+mechanical. The actual question was whether a sibling deployment — a real
+project already run through this loop, with its own customized copy of
+`backlog/prompts/` — had accumulated fixes worth folding back into the fork's
+generic templates. This is the general pattern worth repeating on any fork
+with at least one live deployment: the deployment's prompts drift ahead in
+places the template hasn't caught up to yet, and some of that drift is fixing
+real bugs rather than adding project-specific convention.
+
+## Where things stand
+
+`main` fast-forwarded `3f091b90..a955f19c` (no conflicts, nothing local was
+ahead). Working tree now carries uncommitted edits to `dispatch.ps1`,
+`create-mr.ps1`, `code.md`, `review.md` and `README.md` — not yet committed or
+branched, pending review.
+
+## 1. Most of the diff was the fork already being ahead
+
+The deployment's `dispatch.ps1`/`dispatch.sh`/`README.md` were an older
+snapshot, predating this fork's multi-repo resolution, `Blocked`, `Testing`,
+and `cursor-agent` support. Its `watchdog.ps1` had lost the `Blocked` exclusion
+and its `token-report.ps1` had a hardcoded single-project path — both
+regressions, not fixes, correctly left alone. It also carried a new
+worktree-branch-preview script with no portable core (wall-to-wall
+Docker/framework-specific) — the *pattern* (serve a reviewed branch in
+isolation so a browser-driving MCP can hit it without disturbing the shared
+dev stack) is worth remembering, the file itself was not.
+
+## 2. Four things salvaged, all generic
+
+- **`dispatch.ps1`** strips `OPENAI_API_KEY` now, not just `ANTHROPIC_API_KEY`.
+  Same failure shape: Codex prefers an API key over the ChatGPT subscription's
+  OAuth token in `~/.codex/auth.json` whenever the var reaches the dispatcher's
+  environment (a repo `.env`, a compose file), so a dispatched Codex agent can
+  silently bill the API account, or fail outright if the key is a scoped
+  service-account credential.
+- **`create-mr.ps1`** is now fail-closed on branch resolution. A dotted subtask
+  id (`TASK-587.3`) used to collapse to `587` under a bare `(\d+)` extraction,
+  so the fallback branch lookup matched every `feature/task-587-*` branch and
+  could silently pick a sibling subtask's branch — a real incident on the
+  deployment this was salvaged from. Fixed by: full decimal id extraction,
+  collecting *every* candidate branch and refusing when there is more than one,
+  verifying the resolved branch's task number before opening anything, and
+  refusing rather than opening a second MR if one already claims the task from
+  a different branch. Also fixed a PS 5.1 mojibake bug (`Get-Content -Encoding
+  UTF8` on read, explicit UTF-8 bytes on the POST body — PS 5.1 defaults
+  BOM-less files to the system ANSI codepage both ways).
+- **`code.md` / `review.md`** gained: the "headless — never stop to ask for
+  approval" section (a dispatched agent that ends its turn waiting for
+  permission just stalls a full cycle — there is no one to answer), a "Step 0 —
+  capture your session ID" section generalized across Claude/Codex/opencode/
+  cursor-agent (with both a PowerShell and a POSIX snippet, since this fork
+  ships both dispatchers), the Codex MCP-naming gotcha (tool namespace
+  `mcp__backlog` vs. resource server name `backlog`), a "call `task_view` once"
+  token-cost reminder, and (`review.md` only) a graceful skip of the diff/checks
+  steps when the coder named no implementation branch.
+- **`README.md`** documents all of the above: the `dispatch.ps1` table row now
+  mentions `OPENAI_API_KEY`, the `create-mr.ps1` row calls out fail-closed
+  behaviour, a new "Session ID capture" section explains *why* Step 0 exists,
+  and "Customizing" warns not to drop the headless-approval block when editing
+  the prompts.
+
+## 3. The session-ID gap was not hypothetical — it's already in this repo's own commit history
+
+This is the one worth not re-discovering. `code.md`/`review.md` never had a
+"Step 0" before this session, in *any* version of this fork — but
+`dispatch.ps1`/`dispatch.sh` have depended on agents writing a `Session ID:` /
+`Reviewer Session ID:` line into the task body since the resume feature was
+built, and `dispatch.ps1` even appends the resolved `Model:`/`Effort:` values
+below the prompt "so the agent can copy exact values into its Session block" —
+a block no prompt ever asked for. Commit `6d4fc30e` (already merged, part of
+the fast-forward above) says it outright: *"`is_resume_capable`,
+`is_coder_rework` and `is_reviewer_resume` have never fired... No task on any
+board has one."* That commit added a same-dispatch-log fallback for
+`cursor-agent`/`codex` on `dispatch.sh` (stream-json binaries report
+`session_id` in their own log), but **`dispatch.ps1` got no such fallback**, and
+neither dispatcher gets one for a plain-text agent. Until this session, the only
+way to ever populate that field — on any platform, for `claude` or `opencode` —
+was a human hand-editing the task body. The deployment's prompts happened to
+already carry the instructions that close this; porting them wasn't just
+tidying up someone else's project-specific customization, it fixed a mechanism
+this fork shipped but never wired end-to-end.
+
+## What is left
+
+1. **Not yet committed.** The five files above are dirty in the working tree.
+   No branch cut, no PR opened.
+2. **No test coverage added.** Neither the `OPENAI_API_KEY` strip nor
+   `create-mr.ps1`'s branch-ownership logic has a test — consistent with
+   existing coverage (the pre-existing `ANTHROPIC_API_KEY` strip and the whole
+   of `create-mr.ps1` were also untested before this session), but worth fixing
+   before this ships, especially the ambiguity-refusal path.
+3. **Verify against a real dispatch**, the same way #18 and the 09-17 session
+   verified theirs. Nothing here has been run, only read, diffed, and syntax-
+   checked (`[System.Management.Automation.Language.Parser]::ParseFile` on
+   `create-mr.ps1` and `dispatch.ps1` — parses clean, proves nothing about
+   behaviour).
+4. **`dispatch.sh` did not get the `OPENAI_API_KEY` strip.** Out of scope for
+   this session (the deployment's fix was `.ps1`-only, and dispatch.sh doesn't
+   strip `ANTHROPIC_API_KEY` either — a pre-existing asymmetry, not introduced
+   here), but worth closing for parity.
+
+---
+
 # Session of 2026-09-12 — cursor-agent, and running the loop on other models
 
 ## Why this session happened

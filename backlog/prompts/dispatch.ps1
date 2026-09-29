@@ -70,6 +70,13 @@ function Move-TaskToBlocked {
 # affects the environment of the agents launched below.
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
+# Codex has the identical preference for OPENAI_API_KEY over the ChatGPT
+# subscription token in ~/.codex/auth.json. If the managed project also uses
+# the OpenAI API, its key can reach this process the same way and silently
+# fail (or bill) a dispatched Codex reviewer/coder even while auth.json holds
+# valid subscription tokens. Strip it for the same reason and by the same logic.
+Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
+
 # ── Testing status: hand off to the project's own test runner ─────────────────
 # OPT-IN. This status is not in the default pipeline, because a `Testing` column
 # with no runner behind it strands every task that enters it. To use it:
