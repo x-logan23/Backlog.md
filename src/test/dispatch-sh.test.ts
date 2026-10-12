@@ -520,15 +520,27 @@ describe("dispatch.sh — claude feed", () => {
 });
 
 describe("dispatch.sh — resuming a session", () => {
-	/** A previous dispatch log for (task, status), in the stream-json shape both binaries emit. */
-	const writePreviousLog = (promptsDir: string, taskId: string, safeStatus: string, sessionId: string) => {
+	/**
+	 * A previous dispatch log for (task, status), in the stream-json shape both binaries emit,
+	 * stamped with the created_date of the task it belonged to (`makeProject` uses 2026-01-01).
+	 * Pass `taskCreated: null` for a log written by a dispatcher that did not stamp.
+	 */
+	const writePreviousLog = (
+		promptsDir: string,
+		taskId: string,
+		safeStatus: string,
+		sessionId: string,
+		taskCreated: string | null = "2026-01-01",
+	) => {
 		const logsDir = join(promptsDir, "logs");
 		mkdirSync(logsDir, { recursive: true });
+		const logPath = join(logsDir, `20260101-000000-1-${taskId}-${safeStatus}.log`);
 		writeFileSync(
-			join(logsDir, `20260101-000000-1-${taskId}-${safeStatus}.log`),
+			logPath,
 			`${JSON.stringify({ type: "assistant", session_id: sessionId, message: { id: "m", content: [] } })}\n` +
 				`${JSON.stringify({ type: "result", subtype: "success", session_id: sessionId })}\n`,
 		);
+		if (taskCreated !== null) writeFileSync(`${logPath}.task-created`, taskCreated);
 	};
 
 	guarded("resumes the coder's session on rework, from the id in its own log", () => {
@@ -565,7 +577,9 @@ describe("dispatch.sh — resuming a session", () => {
 		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
 		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555");
 		// Newer, and empty — the shape a crashed dispatch leaves behind.
-		writeFileSync(join(promptsDir, "logs", "20260202-000000-2-BACK-1-In_Progress.log"), "");
+		const emptyLog = join(promptsDir, "logs", "20260202-000000-2-BACK-1-In_Progress.log");
+		writeFileSync(emptyLog, "");
+		writeFileSync(`${emptyLog}.task-created`, "2026-01-01");
 
 		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
 		const result = runDispatcher(
@@ -596,6 +610,56 @@ describe("dispatch.sh — resuming a session", () => {
 		expect(argv).toContain("--output-format");
 		expect(argv).toContain("stream-json");
 		expect(argv).toContain("--verbose");
+	});
+
+	guarded("never resumes a session from an earlier task that had the same id", () => {
+		// Ids are reused once a task is archived. A reviewer once resumed the
+		// archived task's session for a brand-new task with the same id, was told
+		// "the coder has addressed the findings", and approved a 2,000-line change
+		// in two minutes without ever reading its specification.
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555", "2025-06-30");
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.stdout).toContain("fresh session");
+		expect(waitForFile(argsPath)).toBe(true);
+		expect(readFileSync(argsPath, "utf8").split("\n")).not.toContain("--resume");
+	});
+
+	guarded("never resumes from an unstamped log, whose task cannot be told apart", () => {
+		const { promptsDir, tasksDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const taskFile = join(tasksDir, "back-1 - Sample-task.md");
+		writeFileSync(taskFile, `${readFileSync(taskFile, "utf8")}\n## Review\n\nCHANGES REQUESTED.\n`);
+		writePreviousLog(promptsDir, "BACK-1", "In_Progress", "11111111-2222-3333-4444-555555555555", null);
+
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		const result = runDispatcher(
+			scratchDispatcher,
+			{ PATH: `${stubDir}:${process.env.PATH ?? ""}` },
+			{ dryRun: false },
+		);
+		expect(result.stdout).toContain("fresh session");
+		expect(waitForFile(argsPath)).toBe(true);
+		expect(readFileSync(argsPath, "utf8").split("\n")).not.toContain("--resume");
+	});
+
+	guarded("stamps its own log with the task's created_date, so the next round can resume it", () => {
+		const { promptsDir, scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const { stubDir, argsPath } = installStubAgent(String(scratchBase), "claude");
+		runDispatcher(scratchDispatcher, { PATH: `${stubDir}:${process.env.PATH ?? ""}` }, { dryRun: false });
+		expect(waitForFile(argsPath)).toBe(true);
+
+		const logsDir = join(promptsDir, "logs");
+		const stamps = readdirSync(logsDir).filter((name) => name.endsWith("-BACK-1-In_Progress.log.task-created"));
+		expect(stamps).toHaveLength(1);
+		expect(readFileSync(join(logsDir, stamps[0] as string), "utf8")).toBe("2026-01-01");
 	});
 
 	guarded("prefers a Session ID written in the task over the log", () => {

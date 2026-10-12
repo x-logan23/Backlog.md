@@ -122,6 +122,16 @@ last_session_id_for() {
     # the newest file would report "no session" while a resumable one sits right
     # behind it.
     for _sid_log in $(ls -t "$log_dir"/*-"$safe_task_id"-"$_sid_status".log 2>/dev/null || true); do
+        # Task ids are reused once a task is archived, so a log for the same id
+        # may belong to an earlier, different task. Resuming that session hands
+        # the agent another task's conversation (a reviewer once "re-reviewed"
+        # a new 2,000-line change inside the old task's session and approved it
+        # in two minutes). Only resume a log stamped with this task's
+        # created_date; an unstamped log (older dispatcher) is never resumed.
+        if [ -z "$task_created" ] ||
+           [ "$(cat "$_sid_log.task-created" 2>/dev/null || true)" != "$task_created" ]; then
+            continue
+        fi
         _sid="$(grep -oE '"session_id":"[A-Za-z0-9_-]+"' "$_sid_log" 2>/dev/null | tail -1 | sed 's/.*:"//; s/"$//' || true)"
         if [ -n "$_sid" ]; then
             printf '%s' "$_sid"
@@ -204,6 +214,13 @@ if [ -n "$task_file" ] && [ -f "$task_file" ]; then
         echo "dispatch.sh: ignoring $task_file - its id ($found_id) is not ${TASK_ID:-?}."
         task_file=""
     fi
+fi
+
+# The task's created_date tells two tasks that share a (reused) id apart; see
+# last_session_id_for.
+task_created=""
+if [ -n "$task_file" ] && [ -f "$task_file" ]; then
+    task_created="$(grep -m1 '^created_date:' "$task_file" 2>/dev/null | sed "s/^created_date:[[:space:]]*//" | sed "s/[[:space:]]*$//" | tr -d "'\"" || true)"
 fi
 
 # ── Target repository resolution ─────────────────────────────────────────────
@@ -638,6 +655,10 @@ elif [ "$is_reviewer_resume" = "1" ]; then
 else
     echo "dispatch.sh: fresh session (no prior session id for ${TASK_ID:-?})"
 fi
+
+# Stamp this dispatch's log with the task it belongs to, so a later dispatch of
+# a different task that reuses the id never resumes this session.
+[ -n "$task_created" ] && printf '%s' "$task_created" > "$log_file.task-created"
 
 # ── Per-agent launch ─────────────────────────────────────────────────────────
 # The agent runs in the task's repository when it names one, and at the project
