@@ -355,16 +355,19 @@ const installStubAgent = (base: string, binaryName: string) => {
 	mkdirSync(stubDir, { recursive: true });
 	const argsPath = join(base, `${binaryName}.args`);
 	const stdinPath = join(base, `${binaryName}.stdin`);
+	const envPath = join(base, `${binaryName}.env`);
 	const stubPath = join(stubDir, binaryName);
 	writeFileSync(
 		stubPath,
 		// Writes to .part and renames, so the files only appear once complete --
 		// `cat > file` creates it empty first, and the test would otherwise read a
 		// file that exists but has not been filled in yet.
-		`#!/bin/sh\n: > "${argsPath}.part"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${argsPath}.part"; done\ncat > "${stdinPath}.part"\nmv "${stdinPath}.part" "${stdinPath}"\nmv "${argsPath}.part" "${argsPath}"\n`,
+		// The env file is written before either rename, so it is complete by the
+		// time argsPath appears.
+		`#!/bin/sh\nprintf 'ANTHROPIC_API_KEY=%s\\nOPENAI_API_KEY=%s\\n' "\${ANTHROPIC_API_KEY-}" "\${OPENAI_API_KEY-}" > "${envPath}"\n: > "${argsPath}.part"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${argsPath}.part"; done\ncat > "${stdinPath}.part"\nmv "${stdinPath}.part" "${stdinPath}"\nmv "${argsPath}.part" "${argsPath}"\n`,
 		{ mode: 0o755 },
 	);
-	return { stubDir, argsPath, stdinPath };
+	return { stubDir, argsPath, stdinPath, envPath };
 };
 
 const waitForFile = (path: string, timeoutMs = 10000): boolean => {
@@ -516,6 +519,27 @@ describe("dispatch.sh — claude feed", () => {
 		expect(argv).toContain("stream-json");
 		// claude refuses stream-json under --print without it.
 		expect(argv).toContain("--verbose");
+	});
+
+	guarded("strips ANTHROPIC_API_KEY and OPENAI_API_KEY from the launched agent's environment", () => {
+		// With either key present, Claude (or Codex) prefers it over the
+		// subscription login and the dispatched agent bills the API account.
+		const { scratchDispatcher } = makeProject("", "BACK-1", "claude");
+		const { stubDir, argsPath, envPath } = installStubAgent(String(scratchBase), "claude");
+
+		const result = runDispatcher(
+			scratchDispatcher,
+			{
+				PATH: `${stubDir}:${process.env.PATH ?? ""}`,
+				ANTHROPIC_API_KEY: "sk-ant-should-not-leak",
+				OPENAI_API_KEY: "sk-openai-should-not-leak",
+			},
+			{ dryRun: false },
+		);
+		expect(result.status).toBe(0);
+		expect(waitForFile(argsPath)).toBe(true);
+		const captured = readFileSync(envPath, "utf8");
+		expect(captured).toBe("ANTHROPIC_API_KEY=\nOPENAI_API_KEY=\n");
 	});
 });
 

@@ -9,11 +9,11 @@ Drop-in templates for running a coder ↔ reviewer ↔ human-review loop on top 
 | `code.md` | Task → `In Progress` | Reads the task, implements it (initial work or reviewer rework), records notes, moves to `In Review`. Handles merge conflicts inline. |
 | `review.md` | Task → `In Review` | Audits the diff against acceptance criteria + DoD, writes structured findings into the task, moves to either `In Progress` (rework) or `Human Review` (approved). |
 | `ready.md` | Task → `Human Review` | Optional notifier. Prints a one-screen summary into the log file. Extend it if you want Slack/email notifications. |
-| `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. Also strips `ANTHROPIC_API_KEY` (forces subscription auth), scopes MCP servers per role, records token usage, and creates the MR on Human Review. |
+| `dispatch.ps1` | All of the above (Windows) | Picks the prompt file by `$NEW_STATUS`, prepends task context, launches `claude -p` in the background. Also strips `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` (forces subscription auth for Claude and Codex alike), scopes MCP servers per role, records token usage, and creates the MR on Human Review. |
 | `dispatch.sh` | All of the above (POSIX) | Same core loop and the same three guards, for `sh` / `bash`. Uses `set -C` (noclobber) for the atomic claims the Windows version gets from `File::Open CreateNew`. |
 | `token-report.ps1` | After a coder/reviewer session ends (Windows) | Reads the finished session's token usage out-of-band from its transcript; appends to `logs/tokens.csv` and a per-task line. Zero extra agent tokens. |
 | `watchdog.ps1` | On a timer (Windows) | Skips `Blocked` by an explicit rule. Nothing else notices when a dispatched agent *process* dies — a provider limit, a crashed MCP subprocess, a machine hiccup — and the task then sits in `In Progress` forever with nothing behind it. Run it from Task Scheduler every ~10 min: it finds those and re-fires the dispatcher. Stateless apart from per-task retry markers. |
-| `create-mr.ps1` | Task → `Human Review` (Windows, GitLab) | Deterministic, idempotent GitLab MR creation. Needs `GITLAB_PROJECT_ID` (skips cleanly when unset, e.g. GitHub) and a token via `GITLAB_TOKEN` / `.mcp.json` / codex config. |
+| `create-mr.ps1` | Task → `Human Review` (Windows, GitLab) | Deterministic, idempotent, **fail-closed** GitLab MR creation: refuses if the implementation branch can't be resolved to exactly one candidate and verified to belong to the task, and refuses rather than opening a second MR if one already claims the task from a different branch. Needs `GITLAB_PROJECT_ID` (skips cleanly when unset, e.g. GitHub) and a token via `GITLAB_TOKEN` / `.mcp.json` / codex config. |
 | `logs/` | (created on first run) | Per-invocation logs (`<timestamp>-<task_id>-<status>.log` plus `.err` for stderr). Inspect these when a hook misbehaves. |
 
 ## The three guards
@@ -148,6 +148,7 @@ implementation branch. This happens two ways, and both are optional:
 | `GITLAB_PROJECT_ID` | `create-mr.ps1` | Numeric project id. **If unset, MR creation is skipped entirely** (the reviewer agent's own step still runs). |
 | `GITLAB_TOKEN` | `create-mr.ps1`, `mcp-reviewer.json` | API token. Falls back to `.mcp.json` → `~/.codex/config.toml` if the env var is absent. |
 | `GITLAB_TARGET_BRANCH` | `create-mr.ps1` | Target branch for the MR. Defaults to `main`. |
+| `GITLAB_API_URL` | `create-mr.ps1` | GitLab API root. Defaults to `https://gitlab.com/api/v4`; set it for a self-hosted GitLab. |
 
 The `.claude/mcp-reviewer.json` scaffolded by `backlog init` references the token as
 `${GITLAB_TOKEN}` — set the env var, don't hardcode the secret into the committed file.
@@ -288,6 +289,29 @@ dispatches, so both fields need setting on anything the loop should pick up.
 > your own provider terms and admin console, not something the dispatcher knows
 > about; it passes through whatever model you name.
 
+## Session ID capture, and why the prompts ask for it
+
+Rework and reviewer-resume (`--resume <id>` / `codex exec resume <id>` / opencode's
+equivalent) only fire if the dispatcher can find a session id to resume. For
+`claude`, `codex` and `opencode`, that id has nowhere reliable to come from
+except the agent writing it into the task — `code.md` and `review.md`'s "Step
+0" asks each agent to capture its own session id right after launch (it is only
+accurate to read at startup) and record it via MCP `notesAppend` as a `Session
+ID:` / `Reviewer Session ID:` line, which the dispatcher then greps out of the
+task body on the next hop. Skip that step in a customized prompt and every
+rework silently starts a cold session with no memory of what it was sent back
+to fix — the resume branches exist but never fire.
+
+`dispatch.sh` also has a fallback: both `cursor-agent` and `codex` emit
+`"session_id"` in their `--output-format stream-json` / `--json` dispatch logs,
+so on POSIX the previous run's own log can supply the id even if the task body
+has none (the task-body id still wins when both exist — a human or a prompt
+recording one deliberately should beat whatever the log happened to capture).
+`dispatch.ps1` has no such fallback today, so on Windows the prompt's Step 0 is
+the only source for `claude`, `codex` and `opencode`.
+
+`cursor-agent` needs nothing from the prompt either way — see below.
+
 ## Using Cursor (`cursor-agent`)
 
 `cursor-agent` is supported alongside `claude`, and is the way to run the loop on
@@ -347,7 +371,7 @@ resume work the same way they do for Claude, and the live agent panel gets real
 
 ## Customizing
 
-- **Edit the prompts** — they're plain markdown. Add project-specific conventions, point at internal docs, change the verdict thresholds. Each round of running the loop will surface improvements.
+- **Edit the prompts** — they're plain markdown. Add project-specific conventions, point at internal docs, change the verdict thresholds. Each round of running the loop will surface improvements. Keep the "headless — never stop to ask for approval" section near the top of both `code.md` and `review.md` intact, or rephrase it but don't drop it: a dispatched agent that ends its turn to request permission or plan approval just stalls the task until a recovery pass re-fires it, burning a full cycle for nothing — there is no one there to answer.
 - **Per-task overrides** — set `onStatusChange:` on an individual task's frontmatter (or via the modal's "Advanced" section in the browser) to bypass the dispatcher for one task. Useful when a single task needs a different agent or no agent at all.
 - **Add new transitions** — add a `case` to the dispatcher and a new `<status>.md` file. The convention is: prompt filename = lowercase status with spaces collapsed.
 - **Different agents** — `claude`, `cursor-agent`, `codex` and `opencode` have dedicated launch branches; anything else is treated as a path and assumed Claude-compatible on stdin. See *Choosing an agent per task* for how to tier the aliases and pair coder with reviewer. The prompt format is generic markdown; only the MCP-tool calls in the prompts assume Backlog.md MCP is reachable.

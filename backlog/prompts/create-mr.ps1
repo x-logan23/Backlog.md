@@ -9,8 +9,20 @@
 # GitLab-specific. To enable it in a consumer project set:
 #   GITLAB_PROJECT_ID  - numeric project id (required; script skips if unset)
 #   GITLAB_TOKEN       - PAT (else resolved from .mcp.json / ~/.codex/config.toml)
+#   GITLAB_API_URL     - API root, default https://gitlab.com/api/v4 (set it for a
+#                        self-hosted GitLab)
 # On a GitHub project this script simply skips (no project id) and the reviewer
 # agent's own MR/PR step in review.md remains the path.
+#
+# FAIL CLOSED: if the implementation branch cannot be resolved *unambiguously*
+# and verified to belong to this task, NO MR is created. A skipped MR costs a
+# human one minute; a mislabeled MR is a path to merging unreviewed work into
+# main. A dotted subtask id like "TASK-587.3" used to collapse to "587" under a
+# bare '(\d+)' extraction, so the fallback branch lookup matched every
+# feature/task-587-* branch and could pick a sibling subtask's branch instead.
+# Fixed by: full decimal id extraction, collecting ALL candidate branches and
+# refusing on ambiguity, and verifying the resolved branch's task number before
+# any MR is created.
 #
 # Usage: create-mr.ps1 -TaskId TASK-189 -ProjectRoot <path> [-TaskFile <path>]
 
@@ -57,28 +69,62 @@ function Resolve-GitlabToken {
     return ''
 }
 
+# -- Task-number variants ------------------------------------------------------
+# A decimal id like "587.3" appears in branch names as either "587.3" or, far
+# more commonly, "587-3" (feature/task-587-3-android-identity). Build BOTH forms
+# and regex-escape them, so the dot is a literal and not a wildcard -- an
+# unescaped "587.3" also matches "587x3".
+function Get-TaskNumVariants([string] $taskNum) {
+    if (-not $taskNum) { return @() }
+    $variants = @([regex]::Escape($taskNum))
+    if ($taskNum -match '\.') {
+        $variants += [regex]::Escape(($taskNum -replace '\.', '-'))
+    }
+    return ($variants | Select-Object -Unique)
+}
+
+# -- Does a branch name belong to this task? -----------------------------------
+# Returns 'yes'   - matches this task's number
+#         'other' - is a task branch, but for a DIFFERENT task number
+#         'unknown' - does not follow the feature/task-N naming convention
+function Test-BranchOwnership([string] $branch, [string] $taskNum) {
+    $variants = Get-TaskNumVariants $taskNum
+    if ($variants.Count -gt 0) {
+        $alt = ($variants -join '|')
+        # Anchor on a boundary so task-58 does not match task-587.
+        if ([regex]::IsMatch($branch, "^feature/(?:task|issue)-(?:$alt)(?:-|$)")) { return 'yes' }
+    }
+    if ([regex]::IsMatch($branch, '^feature/(?:task|issue)-\d')) { return 'other' }
+    return 'unknown'
+}
+
 # -- Resolve the implementation branch -----------------------------------------
 # Primary source: a "Branch:" line in the task notes (take the LAST one). Never
 # use `git branch --show-current` (the shared main worktree HEAD is unreliable).
-# Fallback: match an origin branch by the task number on a word boundary so
-# task-18 does not match task-189.
-function Resolve-Branch([string] $taskContent, [string] $taskNum) {
+# Fallback: match origin branches by the FULL task number, collecting every
+# candidate so the caller can refuse when there is more than one.
+function Resolve-BranchCandidates([string] $taskContent, [string] $taskNum) {
     if ($taskContent) {
-        $matches = [regex]::Matches($taskContent, '(?im)^\s*Branch:\s*(feature/[A-Za-z0-9._/-]+)\s*$')
-        if ($matches.Count -gt 0) {
-            return $matches[$matches.Count - 1].Groups[1].Value.Trim()
+        $m = [regex]::Matches($taskContent, '(?im)^\s*Branch:\s*(feature/[A-Za-z0-9._/-]+)\s*$')
+        if ($m.Count -gt 0) {
+            return @($m[$m.Count - 1].Groups[1].Value.Trim())
         }
     }
-    # Fallback: ls-remote, anchored on the number boundary.
+
+    $variants = Get-TaskNumVariants $taskNum
+    if ($variants.Count -eq 0) { return @() }
+    $alt = ($variants -join '|')
+
+    $found = @()
     $heads = & git -C $ProjectRoot ls-remote --heads origin 2>$null
     if ($heads) {
-        $pattern = "refs/heads/(feature/(?:task|issue)-$taskNum(?:-[A-Za-z0-9._-]+)?)$"
+        $pattern = "refs/heads/(feature/(?:task|issue)-(?:$alt)(?:-[A-Za-z0-9._-]+)?)$"
         foreach ($line in $heads) {
             $mm = [regex]::Match($line, $pattern)
-            if ($mm.Success) { return $mm.Groups[1].Value }
+            if ($mm.Success) { $found += $mm.Groups[1].Value }
         }
     }
-    return ''
+    return ($found | Select-Object -Unique)
 }
 
 # -- Locate the task file ------------------------------------------------------
@@ -89,17 +135,40 @@ if (-not $TaskFile -or -not (Test-Path $TaskFile)) {
     if ($found) { $TaskFile = $found.FullName }
 }
 
+# -Encoding UTF8 is REQUIRED: PS 5.1's Get-Content defaults to the system ANSI
+# codepage for files with no BOM, and the task .md files are UTF-8 without one.
+# Without this a non-ASCII character in a title arrives as mojibake and ships
+# into the MR title.
 $taskContent = ''
-if ($TaskFile -and (Test-Path $TaskFile)) { $taskContent = Get-Content $TaskFile -Raw }
+if ($TaskFile -and (Test-Path $TaskFile)) { $taskContent = Get-Content $TaskFile -Raw -Encoding UTF8 }
 
+# Capture the FULL identifier including any decimal suffix: "TASK-587.3" -> "587.3".
+# A bare '(\d+)' returns "587" and collides with every sibling subtask.
 $taskNum = ''
-$nm = [regex]::Match($TaskId, '(\d+)')
+$nm = [regex]::Match($TaskId, '(\d+(?:\.\d+)*)')
 if ($nm.Success) { $taskNum = $nm.Groups[1].Value }
 
-$branch = Resolve-Branch $taskContent $taskNum
-if (-not $branch) {
+$candidates = @(Resolve-BranchCandidates $taskContent $taskNum)
+
+if ($candidates.Count -eq 0) {
     Write-Status "no implementation branch found for $TaskId - skipping MR (investigation/process task, or branch not recorded)"
     return
+}
+if ($candidates.Count -gt 1) {
+    Write-Status "AMBIGUOUS branch resolution for $TaskId - skipping MR. Candidates: $($candidates -join ', '). Record a 'Branch: feature/...' line in the task notes and re-run."
+    return
+}
+
+$branch = $candidates[0]
+
+# Verify the branch actually belongs to this task before creating anything.
+$ownership = Test-BranchOwnership $branch $taskNum
+if ($ownership -eq 'other') {
+    Write-Status "REFUSING to create MR: branch '$branch' belongs to a different task, not $TaskId. Fix the branch reference in the task notes."
+    return
+}
+if ($ownership -eq 'unknown') {
+    Write-Status "warning: branch '$branch' does not follow feature/task-<num>-* naming; proceeding because it was recorded explicitly for $TaskId"
 }
 
 # Verify the branch is actually on origin.
@@ -115,7 +184,8 @@ if (-not $token) {
     return
 }
 
-$apiBase = "https://gitlab.com/api/v4/projects/$projectId/merge_requests"
+$apiRoot = if ($env:GITLAB_API_URL) { $env:GITLAB_API_URL.TrimEnd('/') } else { 'https://gitlab.com/api/v4' }
+$apiBase = "$apiRoot/projects/$projectId/merge_requests"
 $headers = @{ 'PRIVATE-TOKEN' = $token }
 
 # -- Idempotency: skip if an MR already exists for this source branch ----------
@@ -131,6 +201,25 @@ try {
     }
 } catch {
     Write-Status "could not query existing MRs ($($_.Exception.Message)) - attempting create anyway"
+}
+
+# -- Cross-check: an open MR already claiming this task, on another branch ------
+# The reviewer agent can also open MRs of its own, so both paths can race. If one
+# already claims this task from a different branch, something is wrong -- refuse
+# rather than adding a second, contradictory MR.
+try {
+    $openUri = "$apiBase" + "?state=opened&per_page=100"
+    $open = Invoke-RestMethod -Method Get -Headers $headers -Uri $openUri -ErrorAction Stop
+    foreach ($mr in $open) {
+        $claims = ($mr.description -and $mr.description -match [regex]::Escape("Closes $TaskId")) -or
+                  ($mr.title -and $mr.title -match [regex]::Escape("($TaskId)"))
+        if ($claims -and $mr.source_branch -ne $branch) {
+            Write-Status "REFUSING to create MR: !$($mr.iid) already claims $TaskId from branch '$($mr.source_branch)' (this run resolved '$branch'). Resolve the conflict by hand."
+            return
+        }
+    }
+} catch {
+    Write-Status "could not cross-check open MRs ($($_.Exception.Message)) - continuing"
 }
 
 # -- Resolve a title from frontmatter (single-line or folded block scalar) -----
@@ -168,8 +257,15 @@ $body = @{
     remove_source_branch = $false
 } | ConvertTo-Json
 
+# Send explicit UTF-8 bytes. PS 5.1 encodes a [string] body with the charset
+# in -ContentType, falling back to a single-byte encoding when there is none (an
+# em dash arrives as "-" and accented letters as invalid UTF-8) -- the other
+# half of the mojibake in the title. Bytes make the body correct even if the
+# ContentType line is edited later; the test suite covers both halves.
+$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+
 try {
-    $created = Invoke-RestMethod -Method Post -Headers $headers -Uri $apiBase -ContentType 'application/json; charset=utf-8' -Body $body -ErrorAction Stop
+    $created = Invoke-RestMethod -Method Post -Headers $headers -Uri $apiBase -ContentType 'application/json; charset=utf-8' -Body $bodyBytes -ErrorAction Stop
     Write-Status "created MR !$($created.iid) for '$branch' -> $targetBranch ($($created.web_url))"
 } catch {
     Write-Status "MR create failed for '$branch': $($_.Exception.Message)"
