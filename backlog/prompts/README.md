@@ -148,6 +148,7 @@ implementation branch. This happens two ways, and both are optional:
 | `GITLAB_PROJECT_ID` | `create-mr.ps1` | Numeric project id. **If unset, MR creation is skipped entirely** (the reviewer agent's own step still runs). |
 | `GITLAB_TOKEN` | `create-mr.ps1`, `mcp-reviewer.json` | API token. Falls back to `.mcp.json` → `~/.codex/config.toml` if the env var is absent. |
 | `GITLAB_TARGET_BRANCH` | `create-mr.ps1` | Target branch for the MR. Defaults to `main`. |
+| `GITLAB_API_URL` | `create-mr.ps1` | GitLab API root. Defaults to `https://gitlab.com/api/v4`; set it for a self-hosted GitLab. |
 
 The `.claude/mcp-reviewer.json` scaffolded by `backlog init` references the token as
 `${GITLAB_TOKEN}` — set the env var, don't hardcode the secret into the committed file.

@@ -9,6 +9,8 @@
 # GitLab-specific. To enable it in a consumer project set:
 #   GITLAB_PROJECT_ID  - numeric project id (required; script skips if unset)
 #   GITLAB_TOKEN       - PAT (else resolved from .mcp.json / ~/.codex/config.toml)
+#   GITLAB_API_URL     - API root, default https://gitlab.com/api/v4 (set it for a
+#                        self-hosted GitLab)
 # On a GitHub project this script simply skips (no project id) and the reviewer
 # agent's own MR/PR step in review.md remains the path.
 #
@@ -182,7 +184,8 @@ if (-not $token) {
     return
 }
 
-$apiBase = "https://gitlab.com/api/v4/projects/$projectId/merge_requests"
+$apiRoot = if ($env:GITLAB_API_URL) { $env:GITLAB_API_URL.TrimEnd('/') } else { 'https://gitlab.com/api/v4' }
+$apiBase = "$apiRoot/projects/$projectId/merge_requests"
 $headers = @{ 'PRIVATE-TOKEN' = $token }
 
 # -- Idempotency: skip if an MR already exists for this source branch ----------
@@ -254,9 +257,11 @@ $body = @{
     remove_source_branch = $false
 } | ConvertTo-Json
 
-# Send explicit UTF-8 bytes. Handing PS 5.1 a [string] body lets it re-encode
-# with the ANSI codepage regardless of the declared charset, which is the other
-# half of the mojibake in the title.
+# Send explicit UTF-8 bytes. PS 5.1 encodes a [string] body with the charset
+# in -ContentType, falling back to a single-byte encoding when there is none (an
+# em dash arrives as "-" and accented letters as invalid UTF-8) -- the other
+# half of the mojibake in the title. Bytes make the body correct even if the
+# ContentType line is edited later; the test suite covers both halves.
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
 try {

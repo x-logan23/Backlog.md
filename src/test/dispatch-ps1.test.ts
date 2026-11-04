@@ -34,17 +34,19 @@ afterEach(() => {
 	}
 });
 
-const makeScratchPromptsDir = (overrides: { codeMd?: string; reviewMd?: string; readyMd?: string } = {}) => {
+const makeScratchPromptsDir = (
+	overrides: { codeMd?: string; reviewMd?: string; readyMd?: string; task?: { id: string; agent: string } } = {},
+) => {
 	scratchRoot = mkdtempSync(join(tmpdir(), "backlog-dispatch-test-"));
-	const promptsDir = join(scratchRoot, "prompts");
-	const logsDir = join(promptsDir, "logs");
+	// The real layout: dispatch.ps1 resolves the project root as ../.. from its
+	// own directory, so it must live at <root>/backlog/prompts. A shallower
+	// layout silently points the project root at the shared temp directory.
 	const projectRoot = scratchRoot;
-	// dispatch.ps1 walks ../.. to resolve project root; create the intermediate
-	// directory so Resolve-Path doesn't fail.
-	const backlogDir = join(projectRoot, "backlog");
-	mkdirSync(promptsDir, { recursive: true });
+	const promptsDir = join(projectRoot, "backlog", "prompts");
+	const logsDir = join(promptsDir, "logs");
+	const tasksDir = join(projectRoot, "backlog", "tasks");
 	mkdirSync(logsDir, { recursive: true });
-	mkdirSync(backlogDir, { recursive: true });
+	mkdirSync(tasksDir, { recursive: true });
 
 	// Copy dispatch.ps1 into the scratch dir so $PSScriptRoot resolves there.
 	const realDispatcher = readFileSync(dispatcherPath, "utf8");
@@ -62,24 +64,55 @@ const makeScratchPromptsDir = (overrides: { codeMd?: string; reviewMd?: string; 
 	writeFileSync(join(promptsDir, "review.md"), overrides.reviewMd ?? "Reviewer prompt body.\n", "utf8");
 	writeFileSync(join(promptsDir, "ready.md"), overrides.readyMd ?? "Notifier prompt body.\n", "utf8");
 
+	// The dispatcher only launches an agent for a task whose frontmatter names
+	// one -- a task with no `agent:` exits 0 without doing anything. Tests that
+	// get past the dry-run gate need this.
+	if (overrides.task) {
+		const { id, agent } = overrides.task;
+		writeFileSync(
+			join(tasksDir, `${id.toLowerCase()} - Sample-task.md`),
+			`---\nid: ${id}\ntitle: Sample task\nstatus: In Progress\nassignee: []\ncreated_date: '2026-01-01'\nlabels: []\ndependencies: []\nagent: ${agent}\n---\n\n## Description\n\nBody.\n`,
+			"utf8",
+		);
+	}
+
 	return { promptsDir, logsDir, scratchDispatcher, scratchRoot: scratchRoot as string };
 };
 
 /**
- * Drops a fake `claude.cmd` first on PATH that reads stdin to a file, so we can
- * exercise the real Start-Process -RedirectStandardInput path without invoking
- * the actual claude CLI. Returns the path of the file the stub will write to.
+ * Drops a fake `claude.cmd` first on PATH that records what it received on
+ * stdin and the API-key variables in its environment, so we can exercise the
+ * real Start-Process path without invoking the actual claude CLI.
+ *
+ * The env file is written first and the stdin capture last, through a .part
+ * file and a rename: once capturePath exists, both files are complete.
  */
-const installStubClaude = (scratchRoot: string): { stubDir: string; capturePath: string } => {
+const installStubClaude = (scratchRoot: string): { stubDir: string; capturePath: string; envPath: string } => {
 	const stubDir = join(scratchRoot, "stubbin");
 	mkdirSync(stubDir, { recursive: true });
 	const capturePath = join(scratchRoot, "stub-captured-stdin.txt");
-	// PowerShell single-quoted strings literalize everything except `'` which
-	// must be doubled. Backslashes are fine inside a single-quoted PS string.
-	const psSafePath = capturePath.replace(/'/g, "''");
-	const stub = `@echo off\r\npowershell -NoProfile -Command "[System.IO.File]::WriteAllText('${psSafePath}', [System.Console]::In.ReadToEnd())"\r\n`;
-	writeFileSync(join(stubDir, "claude.cmd"), stub, "utf8");
-	return { stubDir, capturePath };
+	const envPath = join(scratchRoot, "stub-captured-env.txt");
+	// PowerShell single-quoted strings literalize everything except `'`.
+	const q = (path: string) => `'${path.replace(/'/g, "''")}'`;
+	const stubPs1 = join(stubDir, "stub.ps1");
+	writeFileSync(
+		stubPs1,
+		[
+			"$in = [System.Console]::In.ReadToEnd()",
+			'$envDump = "ANTHROPIC_API_KEY=" + [string]$env:ANTHROPIC_API_KEY + "`nOPENAI_API_KEY=" + [string]$env:OPENAI_API_KEY',
+			`[System.IO.File]::WriteAllText(${q(envPath)}, $envDump)`,
+			`[System.IO.File]::WriteAllText(${q(`${capturePath}.part`)}, $in)`,
+			`Move-Item -LiteralPath ${q(`${capturePath}.part`)} -Destination ${q(capturePath)}`,
+			"",
+		].join("\r\n"),
+		"utf8",
+	);
+	writeFileSync(
+		join(stubDir, "claude.cmd"),
+		`@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "${stubPs1}"\r\n`,
+		"utf8",
+	);
+	return { stubDir, capturePath, envPath };
 };
 
 const waitForFile = async (path: string, timeoutMs = 10000, pollMs = 100): Promise<boolean> => {
@@ -251,56 +284,105 @@ guardedDescribe("dispatch.ps1 — Windows status-change dispatcher", () => {
 		expect(promptContent.charCodeAt(0)).not.toBe(0xfeff);
 	});
 
-	guarded("multi-line prompt actually arrives intact on the spawned child's stdin", async () => {
-		// Round-6 nit #2: the dry-run test above only proves the sidecar file
-		// is correct, not that Start-Process -RedirectStandardInput delivers
-		// that content to claude. This test stubs claude.cmd on PATH, runs the
-		// dispatcher with NO dry-run, and asserts on what the spawned child
-		// actually received via stdin. The original `-ArgumentList $fullPrompt`
-		// bug would fail this test (child would see only "You").
-		const body =
-			"You are the coder agent.\nDo NOT skip steps.\n\nLine with `backticks` and $literal $vars.\nLast line.\n";
-		const { scratchDispatcher, scratchRoot } = makeScratchPromptsDir({ codeMd: body });
-		const { stubDir, capturePath } = installStubClaude(scratchRoot);
+	guarded(
+		"multi-line prompt actually arrives intact on the spawned child's stdin",
+		async () => {
+			// Round-6 nit #2: the dry-run test above only proves the sidecar file
+			// is correct, not that Start-Process -RedirectStandardInput delivers
+			// that content to claude. This test stubs claude.cmd on PATH, runs the
+			// dispatcher with NO dry-run, and asserts on what the spawned child
+			// actually received via stdin. The original `-ArgumentList $fullPrompt`
+			// bug would fail this test (child would see only "You").
+			const body =
+				"You are the coder agent.\nDo NOT skip steps.\n\nLine with `backticks` and $literal $vars.\nLast line.\n";
+			const { scratchDispatcher, scratchRoot } = makeScratchPromptsDir({
+				codeMd: body,
+				task: { id: "BACK-77", agent: "claude" },
+			});
+			const { stubDir, capturePath } = installStubClaude(scratchRoot);
 
-		const result = spawnSync(
-			powershell as string,
-			["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scratchDispatcher],
-			{
-				env: {
-					...process.env,
-					// Prepend the stub dir so Get-Command finds OUR claude.cmd
-					// before any real install on the system.
-					PATH: `${stubDir}${delimiter}${process.env.PATH ?? ""}`,
-					TASK_ID: "BACK-77",
-					OLD_STATUS: "To Do",
-					NEW_STATUS: "In Progress",
-					TASK_TITLE: "stdin delivery check",
-					// Explicitly unset DRY_RUN — we want the real Start-Process.
-					BACKLOG_DISPATCH_DRY_RUN: "",
+			const result = spawnSync(
+				powershell as string,
+				["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scratchDispatcher],
+				{
+					env: {
+						...process.env,
+						// Prepend the stub dir so Get-Command finds OUR claude.cmd
+						// before any real install on the system.
+						PATH: `${stubDir}${delimiter}${process.env.PATH ?? ""}`,
+						TASK_ID: "BACK-77",
+						OLD_STATUS: "To Do",
+						NEW_STATUS: "In Progress",
+						TASK_TITLE: "stdin delivery check",
+						// Explicitly unset DRY_RUN — we want the real Start-Process.
+						BACKLOG_DISPATCH_DRY_RUN: "",
+					},
+					encoding: "utf8",
 				},
-				encoding: "utf8",
-			},
-		);
-		if (result.status !== 0) {
-			throw new Error(`dispatcher exited with ${result.status}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
-		}
+			);
+			if (result.status !== 0) {
+				throw new Error(`dispatcher exited with ${result.status}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+			}
 
-		// Start-Process is detached, so we have to wait for the stub to flush.
-		const arrived = await waitForFile(capturePath, 10000);
-		expect(arrived).toBe(true);
-		const captured = readFileSync(capturePath, "utf8");
-		expect(captured).toContain("You are the coder agent.");
-		expect(captured).toContain("Do NOT skip steps.");
-		expect(captured).toContain("Line with `backticks` and $literal $vars.");
-		expect(captured).toContain("Last line.");
-		expect(captured).toContain("BACK-77");
-		expect(captured).toContain("In Progress");
-		// Length sanity: the original truncation bug would have delivered only
-		// "You" (3 chars). Real prompt body + footer is ~165 chars; the threshold
-		// is well above any plausible truncation and well below the real size.
-		expect(captured.length).toBeGreaterThan(100);
-	});
+			// Start-Process is detached, so we have to wait for the stub to flush.
+			const arrived = await waitForFile(capturePath, 15000);
+			expect(arrived).toBe(true);
+			const captured = readFileSync(capturePath, "utf8");
+			expect(captured).toContain("You are the coder agent.");
+			expect(captured).toContain("Do NOT skip steps.");
+			expect(captured).toContain("Line with `backticks` and $literal $vars.");
+			expect(captured).toContain("Last line.");
+			expect(captured).toContain("BACK-77");
+			expect(captured).toContain("In Progress");
+			// Length sanity: the original truncation bug would have delivered only
+			// "You" (3 chars). Real prompt body + footer is ~165 chars; the threshold
+			// is well above any plausible truncation and well below the real size.
+			expect(captured.length).toBeGreaterThan(100);
+		},
+		30000,
+	);
+
+	guarded(
+		"strips ANTHROPIC_API_KEY and OPENAI_API_KEY from the launched agent's environment",
+		async () => {
+			// With either key in the environment, Claude (or Codex) prefers it over
+			// the subscription login, so a dispatched agent silently bills the API
+			// account -- or fails outright on a scoped service-account key.
+			const { scratchDispatcher, scratchRoot } = makeScratchPromptsDir({
+				task: { id: "BACK-78", agent: "claude" },
+			});
+			const { stubDir, capturePath, envPath } = installStubClaude(scratchRoot);
+
+			const result = spawnSync(
+				powershell as string,
+				["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scratchDispatcher],
+				{
+					env: {
+						...process.env,
+						PATH: `${stubDir}${delimiter}${process.env.PATH ?? ""}`,
+						TASK_ID: "BACK-78",
+						OLD_STATUS: "To Do",
+						NEW_STATUS: "In Progress",
+						TASK_TITLE: "env check",
+						BACKLOG_DISPATCH_DRY_RUN: "",
+						ANTHROPIC_API_KEY: "sk-ant-should-not-leak",
+						OPENAI_API_KEY: "sk-openai-should-not-leak",
+					},
+					encoding: "utf8",
+				},
+			);
+			if (result.status !== 0) {
+				throw new Error(`dispatcher exited with ${result.status}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+			}
+
+			expect(await waitForFile(capturePath, 15000)).toBe(true);
+			const captured = readFileSync(envPath, "utf8");
+			expect(captured).toContain("ANTHROPIC_API_KEY=\n");
+			expect(captured).toMatch(/OPENAI_API_KEY=$/);
+			expect(captured).not.toContain("should-not-leak");
+		},
+		30000,
+	);
 
 	guarded("exits 0 silently for status changes outside the dispatched set", () => {
 		const { logsDir, scratchDispatcher } = makeScratchPromptsDir();

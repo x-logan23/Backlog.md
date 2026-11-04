@@ -22,6 +22,17 @@ if (set -o pipefail) 2>/dev/null; then
     set -o pipefail
 fi
 
+# ── Force subscription auth for dispatched agents ────────────────────────────
+# Same as dispatch.ps1. If the managed project also uses the Anthropic or
+# OpenAI API, its key tends to reach this environment (a repo .env, a compose
+# file, the shell that started the watcher). Claude prefers ANTHROPIC_API_KEY
+# over the subscription login, and Codex prefers OPENAI_API_KEY over the
+# ChatGPT tokens in ~/.codex/auth.json -- so a dispatched agent silently bills
+# the API account, or fails outright on a scoped service-account key. The
+# dispatcher never calls either API itself, so dropping both is free; it only
+# affects the agents launched below, not the application's own environment.
+unset ANTHROPIC_API_KEY OPENAI_API_KEY
+
 # $0, not ${BASH_SOURCE[0]}: the array subscript is a bashism, and this script
 # is invoked as `sh dispatch.sh` by the hook. Under dash -- which IS /bin/sh on
 # Debian and Ubuntu -- the old form raised "Bad substitution", left script_dir

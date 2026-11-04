@@ -19,6 +19,67 @@ the specifics there.
 
 ---
 
+# Session of 2026-11-03 — tests for the salvaged fixes, and the last failing Windows test
+
+## Why this session happened
+
+The 2026-09-28 salvage (commit `1e755e19`, branch
+`fix/salvage-deployment-prompt-fixes`) shipped with no tests and only one of
+the two dispatchers stripping `OPENAI_API_KEY`. Its "What is left" items 1, 2
+and 4 are closed here; item 3 partly (see the end).
+
+## 1. The "last failing test" was the test's fault, not the dispatcher's
+
+`dispatch-ps1.test.ts > multi-line prompt actually arrives intact on the
+spawned child's stdin` had failed deterministically on Windows for weeks and was
+listed as a dispatcher problem in every set of notes since 09-10. It was not.
+Two faults in the harness:
+
+- **No task file.** `dispatch.ps1` exits 0 without launching anything when the
+  task names no `agent:`. That rule arrived after the test was written, and the
+  test never created a task, so the stub agent was simply never started.
+- **The scratch layout was one level short** (`<tmp>/prompts/dispatch.ps1`), so
+  `../..` resolved the project root to the shared temp directory. The dry-run
+  tests passed anyway because nothing they assert depends on the project root.
+
+Fixed by laying out `<tmp>/backlog/prompts` and writing a task with
+`agent: claude`. The 5-second Bun timeout was a second, smaller problem (the
+test waits 10s for the stub); the stdin and env tests now take an explicit 30s.
+Worth remembering: **a dispatcher test that launches an agent needs a task file
+with `agent:`**, on either platform.
+
+## 2. What is tested now
+
+- **Both dispatchers strip `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.**
+  `dispatch.sh` stripped neither until now; it does both, with a test on each
+  side that a stub agent sees them empty.
+- **`create-mr.ps1`** has its own suite (`create-mr-ps1.test.ts`): a scratch
+  project whose `origin` is a local bare repo, and a mock GitLab reached through
+  a new `GITLAB_API_URL` variable (default `https://gitlab.com/api/v4`; also
+  what a self-hosted GitLab needs). It covers the dotted-subtask id, refusal on
+  ambiguous candidates, `Branch:` (last one wins), refusal of another task's
+  branch, a branch missing from origin, an existing MR, an open MR claiming the
+  task from another branch, and a non-ASCII title.
+
+Every one of those was checked by putting the old bug back and watching the
+matching test fail, with one exception: the UTF-8 *body* fix. PS 5.1 already
+encodes a string body correctly when `-ContentType` carries `charset=utf-8`,
+which the script sets, so that half of the mojibake fix is belt-and-braces. The
+test does fail if the charset is dropped as well. The script's comment used to
+claim otherwise and was corrected.
+
+## What is left
+
+1. **No real-agent dispatch.** The dispatcher was run for real (actual
+   `Start-Process`, actual stdin) but against a stub agent, and `create-mr.ps1`
+   against a mock GitLab. A live run with a real `claude` and a real GitLab
+   project is still the one check that spends money and has not been done.
+2. `dispatch.sh` tests were run on Windows only by lifting their platform gate
+   by hand under Git Bash; CI's Ubuntu and macOS jobs are the real check.
+3. Everything in 2026-09-12's list except the stdin test is still open.
+
+---
+
 # Session of 2026-09-28 — salvaging a deployment's fixes, and a session-ID gap that was real
 
 ## Why this session happened
